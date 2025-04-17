@@ -4,6 +4,7 @@ use indicatif::{ParallelProgressIterator, ProgressBar, ProgressStyle};
 use log::{debug, error, info, warn};
 use rand::seq::IndexedRandom as _;
 use rayon::prelude::*;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,8 +16,6 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 use walkdir::WalkDir;
-
-// --- Configuration ---
 
 #[derive(Debug, Clone)]
 pub struct NormalizationOptions {
@@ -50,12 +49,6 @@ impl Default for NormalizationOptions {
 #[derive(Debug)]
 struct AudioFile {
     path: PathBuf,
-}
-
-#[derive(Debug)]
-struct MeasuredLoudness {
-    _path: PathBuf,
-    loudness_lufs: Result<f64, MeasurementError>,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -102,8 +95,6 @@ enum Error {
     },
 }
 
-// --- Main Public Function ---
-
 pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<()> {
     // Configure Rayon thread pool size if specified
     if let Some(num_threads) = options.num_threads {
@@ -124,6 +115,8 @@ pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<()> {
     } else {
         info!("Using default number of threads.");
     }
+
+    let mut loudness_measurements_cache = None;
 
     // 1. Validate options
     validate_options(options)?;
@@ -170,24 +163,22 @@ pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<()> {
                 .progress_chars("#>-"));
             sample_pb.set_message("Measuring samples");
 
-            let loudness_measurements: Vec<MeasuredLoudness> = sampled_files
-                .par_iter()
-                .progress_with(sample_pb.clone())
-                .map(|audio_file| {
-                    let loudness_result = measure_single_file_loudness(&audio_file.path);
-                    if let Err(e) = &loudness_result {
-                        warn!(
-                            "Failed to measure loudness for sample {:?}: {}",
-                            audio_file.path.file_name().unwrap_or_default(),
-                            e
-                        );
-                    }
-                    MeasuredLoudness {
-                        _path: audio_file.path.clone(),
-                        loudness_lufs: loudness_result,
-                    }
-                })
-                .collect();
+            let loudness_measurements: HashMap<PathBuf, Result<f64, MeasurementError>> =
+                sampled_files
+                    .par_iter()
+                    .progress_with(sample_pb.clone())
+                    .map(|audio_file| {
+                        let loudness_result = measure_single_file_loudness(&audio_file.path);
+                        if let Err(e) = &loudness_result {
+                            warn!(
+                                "Failed to measure loudness for sample {:?}: {}",
+                                audio_file.path.file_name().unwrap_or_default(),
+                                e
+                            );
+                        }
+                        (audio_file.path.clone(), loudness_result)
+                    })
+                    .collect();
             sample_pb.finish_with_message("Sample measurement done");
 
             // 5. Calculate target loudness (trimmed mean)
@@ -198,6 +189,9 @@ pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<()> {
                 options.trim_percentage * 100.0,
                 calculated_target
             );
+
+            loudness_measurements_cache = Some(loudness_measurements);
+
             calculated_target
         }
     };
@@ -218,6 +212,8 @@ pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<()> {
     // Arc the options for sharing with parallel threads
     let options_arc = Arc::new(options.clone());
 
+    let loudness_measurements_cache = loudness_measurements_cache
+        .unwrap_or_else(|| unreachable!("loudness_measurements_cache must be set"));
     let results: Vec<Result<(), Error>> = all_audio_files
         .par_iter()
         .progress_with(process_pb.clone())
@@ -228,6 +224,7 @@ pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<()> {
                 options_arc.true_peak_db,
                 &options_arc.input_dir,
                 &options_arc.output_dir,
+                &loudness_measurements_cache,
             )
         })
         .collect();
@@ -556,12 +553,12 @@ fn measure_single_file_loudness(path: &Path) -> Result<f64, MeasurementError> {
 }
 
 fn calculate_target_loudness(
-    measurements: &[MeasuredLoudness],
+    measurements: &HashMap<PathBuf, Result<f64, MeasurementError>>,
     trim_percentage: f64,
 ) -> Result<f64> {
     let valid_loudnesses: Vec<f64> = measurements
         .iter()
-        .filter_map(|m| match &m.loudness_lufs {
+        .filter_map(|(_, loudness_result)| match loudness_result {
             // Filter out errors AND non-finite values like -inf (silence)
             Ok(lufs) if lufs.is_finite() => Some(*lufs),
             _ => None,
@@ -624,17 +621,23 @@ fn process_single_file(
     target_peak_db: f64,
     input_base_dir: &Path,
     output_base_dir: &Path,
+    cache: &HashMap<PathBuf, Result<f64, MeasurementError>>,
 ) -> Result<(), Error> {
     let file_name_os = input_path.file_name().unwrap_or_default();
     let file_name_str = file_name_os.to_string_lossy();
     debug!("Processing: {}", file_name_str);
 
     // 1. Measure current loudness
-    let current_lufs =
-        measure_single_file_loudness(input_path).map_err(|e| Error::Measurement {
-            path: input_path.to_path_buf(),
-            source: e,
-        })?;
+    let current_lufs = match cache.get(input_path) {
+        Some(Ok(lufs_result)) => *lufs_result,
+        // because MeasurementError is not cloneable, so we cannot deal with Some(Err(e))
+        _ => measure_single_file_loudness(input_path).map_err(|e: MeasurementError| {
+            Error::Measurement {
+                path: input_path.to_path_buf(),
+                source: e,
+            }
+        })?,
+    };
 
     // Handle silence or measurement errors resulting in -inf
     if current_lufs.is_infinite() && current_lufs.is_sign_negative() {
