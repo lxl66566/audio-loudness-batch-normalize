@@ -321,8 +321,43 @@ fn find_audio_files(input_dir: &Path) -> Result<Vec<AudioFile>> {
     }
     Ok(audio_files)
 }
+// Helper to update RMS accumulators from planar f32 data
+fn update_rms_accumulators(
+    planar_f32: &[Vec<f32>],
+    sum_of_squares: &mut f64,
+    total_samples: &mut u64,
+) {
+    for channel_buffer in planar_f32 {
+        for sample in channel_buffer {
+            *sum_of_squares += (*sample as f64) * (*sample as f64);
+        }
+        // Increment total_samples by the number of samples in this channel buffer
+        // Assumes all channel buffers have the same length for a given frame decode
+    }
+    // Add samples for the first channel only if channels exist,
+    // assuming all channels have equal length per decode step
+    if let Some(first_channel_buffer) = planar_f32.first() {
+        *total_samples += first_channel_buffer.len() as u64;
+    }
+}
 
-// Decodes audio and feeds it to EBU R128 measurement state
+// Helper to calculate RMS in dBFS from accumulators
+fn calculate_rms_dbfs(sum_of_squares: f64, total_samples: u64) -> f64 {
+    if total_samples == 0 {
+        return f64::NEG_INFINITY; // No samples, effectively silence
+    }
+    let mean_square = sum_of_squares / total_samples as f64;
+    if mean_square <= 0.0 {
+        return f64::NEG_INFINITY; // Silence or numerical issue
+    }
+    let rms = mean_square.sqrt();
+
+    // Convert RMS to dBFS (decibels relative to full scale)
+    // Clamp RMS to avoid log10(0) or log10(negative)
+    20.0 * rms.max(f32::EPSILON as f64).log10()
+}
+
+// Decodes audio, attempts EBU R128, falls back to RMS if needed
 fn measure_single_file_loudness(path: &Path) -> Result<f64, MeasurementError> {
     let file = fs::File::open(path).map_err(MeasurementError::Io)?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
@@ -332,7 +367,7 @@ fn measure_single_file_loudness(path: &Path) -> Result<f64, MeasurementError> {
 
     let probed = symphonia::default::get_probe()
         .format(&hint, mss, &fmt_opts, &meta_opts)
-        .map_err(MeasurementError::Symphonia)?; // Use into() if needed based on Symphonia version
+        .map_err(MeasurementError::Symphonia)?;
 
     let mut format = probed.format;
 
@@ -349,11 +384,11 @@ fn measure_single_file_loudness(path: &Path) -> Result<f64, MeasurementError> {
     let channels = track
         .codec_params
         .channels
-        .ok_or(MeasurementError::UnsupportedFormat)?
-        .count();
+        .ok_or(MeasurementError::UnsupportedFormat)?;
+    let channel_count = channels.count();
 
     // Create EBU R128 state
-    let mut ebu_state = EbuR128::new(channels as u32, sample_rate, Mode::I) // Mode::I for integrated loudness
+    let mut ebu_state = EbuR128::new(channel_count as u32, sample_rate, Mode::I)
         .map_err(MeasurementError::EbuR128)?;
 
     let dec_opts: DecoderOptions = Default::default();
@@ -362,7 +397,11 @@ fn measure_single_file_loudness(path: &Path) -> Result<f64, MeasurementError> {
         .map_err(MeasurementError::Symphonia)?;
 
     let mut packet_count = 0;
-    let mut decoded_frames = 0;
+    let mut decoded_frames_count = 0; // Use a more descriptive name
+
+    // Accumulators for RMS fallback
+    let mut rms_sum_of_squares: f64 = 0.0;
+    let mut rms_total_samples: u64 = 0;
 
     loop {
         match format.next_packet() {
@@ -370,13 +409,47 @@ fn measure_single_file_loudness(path: &Path) -> Result<f64, MeasurementError> {
                 packet_count += 1;
                 match decoder.decode(&packet) {
                     Ok(decoded) => {
-                        decoded_frames += decoded.frames();
-                        // Convert buffer to planar f32 and feed to EBU state
-                        feed_ebur128_state(&mut ebu_state, &decoded)?;
+                        decoded_frames_count += decoded.frames() as u64; // Accumulate total frames
+
+                        // --- Feed EBU R128 ---
+                        // Convert buffer to planar f32 (handle potential errors)
+                        match convert_buffer_to_planar_f32(&decoded) {
+                            Ok(planar_f32) => {
+                                // Feed EBU state
+                                let plane_slices: Vec<&[f32]> =
+                                    planar_f32.iter().map(|v| v.as_slice()).collect();
+                                if let Err(e) = ebu_state.add_frames_planar_f32(&plane_slices) {
+                                    // Decide if this error is fatal or skippable
+                                    warn!(
+                                        "EBU R128 add_frames failed for chunk in {:?}: {}. Skipping chunk for EBU.",
+                                        path.file_name().unwrap_or_default(),
+                                        e
+                                    );
+                                    // Potentially return Err(MeasurementError::EbuR128(e)) if it's critical
+                                }
+
+                                // --- Update RMS Accumulators ---
+                                update_rms_accumulators(
+                                    &planar_f32,
+                                    &mut rms_sum_of_squares,
+                                    &mut rms_total_samples,
+                                );
+                            }
+                            Err(e) => {
+                                // Failed to convert this buffer, log and skip chunk for *both* measurements
+                                warn!(
+                                    "Buffer conversion failed for chunk in {:?}: {}. Skipping chunk.",
+                                    path.file_name().unwrap_or_default(),
+                                    e
+                                );
+                                // Optionally return the error if conversion failure is critical
+                                // return Err(e);
+                            }
+                        }
                     }
                     Err(SymphoniaError::DecodeError(e)) => {
                         warn!(
-                            "Decode error in {:?}: {}",
+                            "Decode error in {:?}: {}. Skipping packet.",
                             path.file_name().unwrap_or_default(),
                             e
                         );
@@ -392,12 +465,12 @@ fn measure_single_file_loudness(path: &Path) -> Result<f64, MeasurementError> {
                         break; // Expected EOF during decode
                     }
                     Err(e) => {
-                        warn!(
+                        // Treat other decode errors as potentially fatal for this file
+                        error!(
                             "Unhandled decoder error in {:?}: {}",
                             path.file_name().unwrap_or_default(),
                             e
                         );
-                        // Optionally break or return error depending on severity
                         return Err(MeasurementError::Symphonia(e));
                     }
                 }
@@ -423,43 +496,63 @@ fn measure_single_file_loudness(path: &Path) -> Result<f64, MeasurementError> {
     }
 
     debug!(
-        "Finished decoding {:?}: {} packets, {} frames",
+        "Finished decoding {:?}: {} packets, {} total frames decoded.",
         path.file_name().unwrap_or_default(),
         packet_count,
-        decoded_frames
+        decoded_frames_count // Use the accumulated frame count
+    );
+    // Log total samples accumulated for RMS (should be frames * channels)
+    debug!(
+        "Total samples accumulated for RMS calculation in {:?}: {}",
+        path.file_name().unwrap_or_default(),
+        rms_total_samples
     );
 
-    // Get integrated loudness
+    // --- Attempt EBU R128 Measurement ---
     match ebu_state.loudness_global() {
-        Ok(lufs) => {
-            if lufs.is_infinite() || lufs.is_nan() {
-                // This often happens with silence or very short files
-                warn!(
-                    "Loudness measurement resulted in non-finite value for {:?}. Treating as silence (-inf LUFS).",
-                    path.file_name().unwrap_or_default()
-                );
-                // You might return a specific very low value or handle it differently
-                Ok(f64::NEG_INFINITY) // Or perhaps bail with NotEnoughData
-            } else {
-                Ok(lufs)
-            }
+        Ok(lufs) if lufs.is_finite() => {
+            // EBU R128 succeeded and gave a valid number
+            debug!(
+                "EBU R128 measurement successful for {:?}: {:.2} LUFS",
+                path.file_name().unwrap_or_default(),
+                lufs
+            );
+            Ok(lufs)
         }
-        Err(e) => Err(MeasurementError::EbuR128(e)),
+        Ok(lufs_non_finite) => {
+            // EBU R128 succeeded but gave Inf or NaN
+            debug!(
+                "EBU R128 measurement resulted in non-finite value ({}) for {:?}. Falling back to RMS.",
+                lufs_non_finite,
+                path.file_name().unwrap_or_default(),
+            );
+            // --- Fallback to RMS ---
+            let rms_dbfs = calculate_rms_dbfs(rms_sum_of_squares, rms_total_samples);
+            debug!(
+                // Log fallback value
+                "Fallback RMS measurement for {:?}: {:.2} dBFS",
+                path.file_name().unwrap_or_default(),
+                rms_dbfs
+            );
+            Ok(rms_dbfs)
+        }
+        Err(e) => {
+            // Other EBU R128 finalization error
+            debug!(
+                "EBU R128 finalization error for {:?}: {}. Cannot measure loudness. Attempting fallback to RMS.",
+                path.file_name().unwrap_or_default(),
+                e
+            );
+            let rms_dbfs = calculate_rms_dbfs(rms_sum_of_squares, rms_total_samples);
+            debug!(
+                // Log fallback value
+                "Fallback RMS measurement for {:?}: {:.2} dBFS",
+                path.file_name().unwrap_or_default(),
+                rms_dbfs
+            );
+            Ok(rms_dbfs)
+        }
     }
-}
-
-// Helper to convert Symphonia buffer to planar f32 and feed EBU R128 state
-fn feed_ebur128_state(
-    ebu_state: &mut EbuR128,
-    decoded: &AudioBufferRef<'_>,
-) -> Result<(), MeasurementError> {
-    let planar_f32 = convert_buffer_to_planar_f32(decoded).map_err(MeasurementError::Other)?;
-
-    let plane_slices: Vec<&[f32]> = planar_f32.iter().map(|v| v.as_slice()).collect();
-    ebu_state
-        .add_frames_planar_f32(&plane_slices)
-        .map_err(MeasurementError::EbuR128)?;
-    Ok(())
 }
 
 fn calculate_target_loudness(

@@ -28,23 +28,25 @@ Choose one of the following methods:
 loudness-normalize <input_directory> [options]
 ```
 
-## Options
+Options:
 
 ```
-<input_directory>                Input directory containing audio files
--o, --output <path>              Output directory (default: {input_directory}_normalized)
--s, --sample-percentage <float>  Percentage of files to sample (default: 1.00)
--t, --trim-percentage <float>    Trim percentage for loudness calculation (default: 0.30)
-    --target-lufs <float>        Target loudness value in LUFS (default: auto-calculated)
-    --true-peak-db <float>       Target true peak in dBTP (default: -1.5)
--t, --threads <number>           Number of processing threads (default: CPU core count)
+<input_directory>                     Input directory for audio files
+-o, --output <path>                   Output directory (default: {input_directory}_normalized)
+-s, --sample-percentage <float>       Percentage of files to sample (default: 1.00, samples all audio files)
+-t, --trim-percentage <float>         Trimming percentage for averaging (default: 0.30, removes the highest 15% and lowest 15%)
+    --target-lufs <float>             Target loudness value (LUFS) (default: auto-calculated)
+    --true-peak-db <float>            Target true peak (dBTP) (default: -1.5)
+-t, --threads <number>                Number of processing threads (default: CPU core count)
 ```
 
 ## Theory
 
-1. Scans the input directory for all audio files.
-2. Samples files based on `sample_percentage` and calculates the trimmed mean loudness using `trim_percentage`. For example, setting `trim_percentage` to 0.3 discards the top 15% and bottom 15% loudness segments in the samples.
-3. Adjusts audio loudness using the target LUFS value and the EBU R128 algorithm.
+1. Search for all audio files in the input directory.
+2. Randomly sample all audio files based on `sample_percentage` to calculate the target loudness (LUFS).
+   - If the audio's active duration is too short, the EBU R128 algorithm may return NaN, in which case it will fall back to RMS loudness calculation.
+3. Calculate the trimmed mean of audio loudness based on `trim_percentage`. For example, setting `trim_percentage` to 0.3 will remove the loudness values in the top 15% and bottom 15% of the samples.
+4. Adjust the audio loudness using the target loudness (LUFS) and the EBU R128 algorithm.
 
 ## Special Thanks
 
