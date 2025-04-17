@@ -1,7 +1,14 @@
 [package]
-edition = "2024"
-name    = "audio-loudness-batch-normalize"
-version = "0.1.0"
+authors     = ["lxl66566 <lxl66566@gmail.com>"]
+categories  = ["multimedia::audio"]
+description = "Easy to use audio loudness batch normalization tool using EBU R128 and RMS"
+edition     = "2024"
+keywords    = ["audio", "loudness", "normalization", "batch-processing", "multimedia"]
+license     = "MIT"
+name        = "audio-loudness-batch-normalize"
+readme      = "README.md"
+repository  = "https://github.com/lxl66566/audio-loudness-batch-normalize"
+version     = "0.1.0"
 
 [dependencies]
 anyhow            = "1.0"
@@ -15,8 +22,11 @@ pathdiff          = "0.2"
 pretty_env_logger = "0.5"
 rand              = "0.9"
 rayon             = "1.8"
+strum             = "0.27"
+strum_macros      = "0.27"
 symphonia         = { version = "0.5", features = ["all-codecs", "all-formats"] }
 thiserror         = "2.0"
+vorbis_rs         = "0.5"
 walkdir           = "2"
 
 [[bin]]

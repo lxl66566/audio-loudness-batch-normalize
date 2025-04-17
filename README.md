@@ -40,6 +40,10 @@ Options:
 -t, --threads <number>                Number of processing threads (default: CPU core count)
 ```
 
+## Tip
+
+- Only WAV, OGG encoders are supported currently. If the input format is not OGG, the output will be in WAV format and may need to be manually converted.
+
 ## Theory
 
 1. Search for all audio files in the input directory.

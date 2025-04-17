@@ -1,13 +1,19 @@
+pub mod error;
+pub mod save;
+
+use crate::error::{Error, MeasurementError};
+use crate::save::save_as_ogg;
 use anyhow::{Context, Result, anyhow, bail};
 use ebur128::{EbuR128, Mode};
 use indicatif::{ParallelProgressIterator, ProgressBar, ProgressStyle};
 use log::{debug, error, info, warn};
 use rand::seq::IndexedRandom as _;
 use rayon::prelude::*;
+use save::save_as_wav;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use strum_macros::Display;
 use symphonia::core::audio::{AudioBufferRef, SignalSpec};
 use symphonia::core::codecs::DecoderOptions;
 use symphonia::core::errors::Error as SymphoniaError;
@@ -16,6 +22,47 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 use walkdir::WalkDir;
+
+#[derive(Debug, PartialEq, Display)]
+#[strum(serialize_all = "camelCase")]
+pub enum AudioFormats {
+    Wav,
+    Mp3,
+    Flac,
+    Ogg,
+    M4a,
+    Aac,
+    Opus,
+}
+
+impl AudioFormats {
+    #[inline]
+    pub fn supported_extensions() -> &'static [&'static str] {
+        &["wav", "mp3", "flac", "ogg", "m4a", "aac", "opus"]
+    }
+
+    #[inline]
+    pub fn from_path(value: &Path) -> Option<Self> {
+        Some(
+            match value
+                .extension()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_lowercase()
+                .as_ref()
+            {
+                "wav" => Self::Wav,
+                "mp3" => Self::Mp3,
+                "flac" => Self::Flac,
+                "ogg" => Self::Ogg,
+                "m4a" => Self::M4a,
+                "aac" => Self::Aac,
+                "opus" => Self::Opus,
+                _ => return None,
+            },
+        )
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct NormalizationOptions {
@@ -49,50 +96,6 @@ impl Default for NormalizationOptions {
 #[derive(Debug)]
 struct AudioFile {
     path: PathBuf,
-}
-
-#[derive(thiserror::Error, Debug)]
-enum MeasurementError {
-    #[error("Symphonia error: {0}")]
-    Symphonia(#[from] SymphoniaError),
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("EBU R128 error: {0}")]
-    EbuR128(#[from] ebur128::Error),
-    #[error("No compatible audio track found")]
-    NoTrack,
-    #[error("Unsupported sample format")]
-    UnsupportedFormat,
-    #[error("Other error: {0}")]
-    Other(#[from] anyhow::Error),
-}
-
-#[derive(thiserror::Error, Debug)]
-enum Error {
-    #[error("Measurement failed: {source}")]
-    Measurement {
-        path: PathBuf,
-        #[source]
-        source: MeasurementError,
-    },
-    #[error("Audio decoding/processing failed for {path}: {source}")]
-    Processing {
-        path: PathBuf,
-        #[source]
-        source: anyhow::Error, // Catch-all for symphonia/hound during processing
-    },
-    #[error("Audio writing failed for {path}: {source}")]
-    Writing {
-        path: PathBuf,
-        #[source]
-        source: hound::Error,
-    },
-    #[error("I/O error during processing of {path}: {source}")]
-    Io {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
 }
 
 pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<()> {
@@ -209,9 +212,6 @@ pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<()> {
         .progress_chars("#>-"));
     process_pb.set_message("Processing files");
 
-    // Arc the options for sharing with parallel threads
-    let options_arc = Arc::new(options.clone());
-
     let loudness_measurements_cache = loudness_measurements_cache
         .unwrap_or_else(|| unreachable!("loudness_measurements_cache must be set"));
     let results: Vec<Result<(), Error>> = all_audio_files
@@ -221,9 +221,9 @@ pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<()> {
             process_single_file(
                 &audio_file.path,
                 target_lufs,
-                options_arc.true_peak_db,
-                &options_arc.input_dir,
-                &options_arc.output_dir,
+                options.true_peak_db,
+                &options.input_dir,
+                &options.output_dir,
                 &loudness_measurements_cache,
             )
         })
@@ -293,10 +293,6 @@ fn validate_options(options: &NormalizationOptions) -> Result<()> {
 fn find_audio_files(input_dir: &Path) -> Result<Vec<AudioFile>> {
     let mut audio_files = Vec::new();
     // Define supported extensions (lowercase)
-    let supported_extensions: Vec<String> = ["wav", "mp3", "flac", "ogg", "m4a", "aac", "opus"]
-        .iter()
-        .map(|s| s.to_lowercase())
-        .collect();
 
     for entry in WalkDir::new(input_dir)
         .into_iter()
@@ -309,7 +305,7 @@ fn find_audio_files(input_dir: &Path) -> Result<Vec<AudioFile>> {
             .and_then(|os| os.to_str())
             .map(|s| s.to_lowercase())
         {
-            if supported_extensions.contains(&ext) {
+            if AudioFormats::supported_extensions().contains(&ext.as_str()) {
                 audio_files.push(AudioFile {
                     path: path.to_path_buf(),
                 });
@@ -623,6 +619,11 @@ fn process_single_file(
     output_base_dir: &Path,
     cache: &HashMap<PathBuf, Result<f64, MeasurementError>>,
 ) -> Result<(), Error> {
+    let file_format: AudioFormats =
+        AudioFormats::from_path(input_path).ok_or_else(|| Error::Processing {
+            path: input_path.to_path_buf(),
+            source: anyhow::anyhow!("Unsupported audio format"),
+        })?;
     let file_name_os = input_path.file_name().unwrap_or_default();
     let file_name_str = file_name_os.to_string_lossy();
     debug!("Processing: {}", file_name_str);
@@ -715,7 +716,6 @@ fn process_single_file(
         })?;
 
     let mut output_path = output_base_dir.join(relative_path);
-    output_path.set_extension("wav"); // Force WAV output
 
     // Ensure parent directory exists
     if let Some(parent) = output_path.parent() {
@@ -725,31 +725,35 @@ fn process_single_file(
         })?;
     }
 
-    // 7. Write to WAV using hound
-    let hound_spec = hound::WavSpec {
-        channels: spec.channels.count() as u16,
-        sample_rate: spec.rate,
-        bits_per_sample: 32, // Use 32-bit float for best quality after processing
-        sample_format: hound::SampleFormat::Float,
-    };
-
-    let mut writer =
-        hound::WavWriter::create(&output_path, hound_spec).map_err(|e| Error::Writing {
-            path: output_path.clone(),
-            source: e,
-        })?;
-
-    for sample in final_samples_interleaved {
-        writer.write_sample(sample).map_err(|e| Error::Writing {
-            path: output_path.clone(),
-            source: e,
-        })?;
+    match file_format {
+        AudioFormats::Ogg => {
+            output_path.set_extension(file_format.to_string());
+            save_as_ogg(
+                &output_path,
+                spec.channels.count(),
+                spec.rate,
+                &final_samples_interleaved,
+            )
+            .map_err(|e| Error::Writing {
+                path: output_path.clone(),
+                source: e,
+            })?;
+        }
+        // All other formats fallback to wav
+        _ => {
+            output_path.set_extension("wav");
+            save_as_wav(
+                &output_path,
+                spec.channels.count(),
+                spec.rate,
+                &final_samples_interleaved,
+            )
+            .map_err(|e| Error::Writing {
+                path: output_path.clone(),
+                source: e,
+            })?;
+        }
     }
-
-    writer.finalize().map_err(|e| Error::Writing {
-        path: output_path.clone(),
-        source: e,
-    })?;
 
     debug!("Successfully wrote normalized file to {:?}", output_path);
     Ok(())
