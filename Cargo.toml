@@ -1,0 +1,30 @@
+[package]
+edition = "2024"
+name    = "audio-loudness-batch-normalize"
+version = "0.1.0"
+
+[dependencies]
+anyhow            = "1.0"
+clap              = { version = "4.5", features = ["derive"] }
+ebur128           = "0.1"
+hound             = "3.5"
+indicatif         = { version = "0.17", features = ["rayon"] }
+log               = "0.4"
+num-traits        = "0.2"
+pathdiff          = "0.2"
+pretty_env_logger = "0.5"
+rand              = "0.9"
+rayon             = "1.8"
+symphonia         = { version = "0.5", features = ["all-codecs", "all-formats"] }
+thiserror         = "2.0"
+walkdir           = "2"
+
+[[bin]]
+name = "loudness-normalize"
+path = "src/main.rs"
+
+[profile.release]
+lto       = true
+opt-level = "z"
+panic     = "abort"
+strip     = true

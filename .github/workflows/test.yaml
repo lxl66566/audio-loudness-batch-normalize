@@ -1,0 +1,38 @@
+name: Test
+
+on:
+  pull_request:
+  workflow_dispatch:
+  push:
+    tags:
+      - v*
+
+jobs:
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cargo-bins/cargo-binstall@main
+      - run: cargo binstall -y --no-symlinks cargo-nextest
+      - name: Setup sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.8
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo nextest run --all-features --no-tests pass
+
+  auto-merge:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.actor == 'dependabot[bot]'
+    permissions:
+      pull-requests: write
+      contents: write
+    steps:
+      - name: Enable auto-merge for Dependabot PRs
+        run: gh pr merge --auto --merge "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
