@@ -3,6 +3,16 @@ use vorbis_rs::VorbisEncoderBuilder;
 use crate::error::WritingError;
 use std::{fs::File, num::NonZero, path::Path};
 
+/// Saves audio data as a WAV file
+///
+/// # Arguments
+/// * `path` - Output file path
+/// * `channels` - Number of audio channels
+/// * `sample_rate` - Sample rate in Hz
+/// * `samples` - Interleaved audio samples in 32-bit float format
+///
+/// # Returns
+/// Result indicating success or a WritingError
 pub fn save_as_wav(
     path: &Path,
     channels: usize,
@@ -22,6 +32,19 @@ pub fn save_as_wav(
     Ok(writer.finalize()?)
 }
 
+/// Saves audio data as an Ogg Vorbis file
+///
+/// # Arguments
+/// * `path` - Output file path
+/// * `channels` - Number of audio channels
+/// * `sample_rate` - Sample rate in Hz
+/// * `samples` - Interleaved audio samples in 32-bit float format
+///
+/// # Returns
+/// Result indicating success or a WritingError
+///
+/// # Panics
+/// Panics if the number of channels is zero
 pub fn save_as_ogg(
     path: &Path,
     channels: usize,

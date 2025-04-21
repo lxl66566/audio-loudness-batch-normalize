@@ -1,4 +1,6 @@
+/// Module for error handling
 pub mod error;
+/// Module for saving audio files
 pub mod save;
 
 use crate::error::{Error, MeasurementError};
@@ -23,6 +25,7 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 use walkdir::WalkDir;
 
+/// Represents supported audio file formats
 #[derive(Debug, PartialEq, Display)]
 #[strum(serialize_all = "camelCase")]
 pub enum AudioFormats {
@@ -36,15 +39,18 @@ pub enum AudioFormats {
 }
 
 impl AudioFormats {
+    /// Returns a list of supported file extensions
     #[inline]
     pub fn supported_extensions() -> &'static [&'static str] {
         &["wav", "mp3", "flac", "ogg", "m4a", "aac", "opus"]
     }
 
+    /// Creates an AudioFormats enum from a file path based on its extension
     #[inline]
-    pub fn from_path(value: &Path) -> Option<Self> {
+    pub fn from_path(value: impl AsRef<Path>) -> Option<Self> {
         Some(
             match value
+                .as_ref()
                 .extension()
                 .unwrap_or_default()
                 .to_string_lossy()
@@ -64,18 +70,22 @@ impl AudioFormats {
     }
 }
 
+/// Configuration options for audio normalization process
 #[derive(Debug, Clone)]
 pub struct NormalizationOptions {
+    /// Input directory containing audio files to process
     pub input_dir: PathBuf,
+    /// Output directory for normalized audio files
     pub output_dir: PathBuf,
+    /// Percentage of files to sample for calculating target loudness (0.0 to 1.0)
     pub sample_percentage: f64,
+    /// Percentage of measurements to trim when calculating average loudness (0.0 to 0.5)
     pub trim_percentage: f64,
-    /// Target loudness in LUFS. If None, it's calculated automatically.
+    /// Target loudness in LUFS (Loudness Units Full Scale)
     pub target_lufs: Option<f64>,
-    /// Target true peak in dBTP. Samples will be limited to this ceiling.
-    /// EBU R128 recommends -1.0 dBTP or -2.0 dBTP.
+    /// Target true peak in dBTP (decibels True Peak)
     pub true_peak_db: f64,
-    /// Number of threads for parallel processing. 0 means use Rayon's default.
+    /// Number of threads for parallel processing
     pub num_threads: Option<usize>,
 }
 
@@ -85,19 +95,21 @@ impl Default for NormalizationOptions {
             input_dir: PathBuf::from("."),
             output_dir: PathBuf::from("./normalized_output"),
             sample_percentage: 0.30,
-            trim_percentage: 0.30, // 30% total (15% low, 15% high)
-            target_lufs: None,     // Calculate automatically
-            true_peak_db: -1.5,    // Common target peak
+            trim_percentage: 0.30,
+            target_lufs: None,
+            true_peak_db: -1.5,
             num_threads: None,
         }
     }
 }
 
+/// Represents an audio file to be processed
 #[derive(Debug)]
 struct AudioFile {
     path: PathBuf,
 }
 
+/// Main function to normalize the loudness of all audio files in a folder
 pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<()> {
     // Configure Rayon thread pool size if specified
     if let Some(num_threads) = options.num_threads {
@@ -212,8 +224,6 @@ pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<()> {
         .progress_chars("#>-"));
     process_pb.set_message("Processing files");
 
-    let loudness_measurements_cache = loudness_measurements_cache
-        .unwrap_or_else(|| unreachable!("loudness_measurements_cache must be set"));
     let results: Vec<Result<(), Error>> = all_audio_files
         .par_iter()
         .progress_with(process_pb.clone())
@@ -257,64 +267,12 @@ pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<()> {
 
 // --- Helper Functions ---
 
-fn validate_options(options: &NormalizationOptions) -> Result<()> {
-    if !options.input_dir.is_dir() {
-        bail!(
-            "Input path is not a valid directory: {:?}",
-            options.input_dir
-        );
-    }
-    if !options.output_dir.exists() {
-        fs::create_dir_all(&options.output_dir).with_context(|| {
-            format!(
-                "Failed to create output directory: {:?}",
-                options.output_dir
-            )
-        })?;
-        info!("Created output directory: {:?}", options.output_dir);
-    } else if !options.output_dir.is_dir() {
-        bail!(
-            "Output path exists but is not a directory: {:?}",
-            options.output_dir
-        );
-    }
-    if !(0.0..0.5).contains(&options.trim_percentage) {
-        bail!("Trim percentage must be between 0.0 and 0.5 (exclusive of 0.5)");
-    }
-    if options.true_peak_db > 0.0 {
-        warn!(
-            "Target true peak {:.1} dBTP is above 0 dBFS. This will likely cause clipping in standard formats.",
-            options.true_peak_db
-        );
-    }
-    Ok(())
-}
-
-fn find_audio_files(input_dir: &Path) -> Result<Vec<AudioFile>> {
-    let mut audio_files = Vec::new();
-    // Define supported extensions (lowercase)
-
-    for entry in WalkDir::new(input_dir)
-        .into_iter()
-        .filter_map(|e| e.ok()) // Filter out directory reading errors
-        .filter(|e| e.file_type().is_file())
-    {
-        let path = entry.path();
-        if let Some(ext) = path
-            .extension()
-            .and_then(|os| os.to_str())
-            .map(|s| s.to_lowercase())
-        {
-            if AudioFormats::supported_extensions().contains(&ext.as_str()) {
-                audio_files.push(AudioFile {
-                    path: path.to_path_buf(),
-                });
-            }
-        }
-    }
-    Ok(audio_files)
-}
-// Helper to update RMS accumulators from planar f32 data
+/// Updates RMS (Root Mean Square) accumulators for audio data
+///
+/// # Arguments
+/// * `planar_f32` - Audio data in planar format (separate channels)
+/// * `sum_of_squares` - Accumulator for sum of squared samples
+/// * `total_samples` - Counter for total number of samples processed
 fn update_rms_accumulators(
     planar_f32: &[Vec<f32>],
     sum_of_squares: &mut f64,
@@ -334,7 +292,14 @@ fn update_rms_accumulators(
     }
 }
 
-// Helper to calculate RMS in dBFS from accumulators
+/// Calculates RMS (Root Mean Square) value in dBFS (decibels Full Scale)
+///
+/// # Arguments
+/// * `sum_of_squares` - Sum of squared samples
+/// * `total_samples` - Total number of samples
+///
+/// # Returns
+/// RMS value in dBFS, or negative infinity for silence
 fn calculate_rms_dbfs(sum_of_squares: f64, total_samples: u64) -> f64 {
     if total_samples == 0 {
         return f64::NEG_INFINITY; // No samples, effectively silence
@@ -350,8 +315,15 @@ fn calculate_rms_dbfs(sum_of_squares: f64, total_samples: u64) -> f64 {
     20.0 * rms.max(f32::EPSILON as f64).log10()
 }
 
-// Decodes audio, attempts EBU R128, falls back to RMS if needed
-fn measure_single_file_loudness(path: &Path) -> Result<f64, MeasurementError> {
+/// Measures the loudness of a single audio file using EBU R128 or RMS fallback
+///
+/// # Arguments
+/// * `path` - Path to the audio file
+///
+/// # Returns
+/// Measured loudness in LUFS (Loudness Units Full Scale) or dBFS if fallback to RMS
+pub fn measure_single_file_loudness(path: impl AsRef<Path>) -> Result<f64, MeasurementError> {
+    let path = path.as_ref();
     let file = fs::File::open(path).map_err(MeasurementError::Io)?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
     let hint = Hint::new();
@@ -548,6 +520,14 @@ fn measure_single_file_loudness(path: &Path) -> Result<f64, MeasurementError> {
     }
 }
 
+/// Calculates target loudness from a set of measurements using trimmed mean
+///
+/// # Arguments
+/// * `measurements` - Map of file paths to their loudness measurements
+/// * `trim_percentage` - Percentage of measurements to trim from each end
+///
+/// # Returns
+/// Target loudness value in LUFS
 fn calculate_target_loudness(
     measurements: &HashMap<PathBuf, Result<f64, MeasurementError>>,
     trim_percentage: f64,
@@ -610,15 +590,24 @@ fn calculate_target_loudness(
     Ok(mean)
 }
 
-// Processes a single file: measure, calculate gain, decode, apply gain/limit, encode to WAV
-fn process_single_file(
-    input_path: &Path,
+/// Processes a single audio file: measures loudness, applies gain, and saves the result
+///
+/// # Arguments
+/// * `input_path` - Path to input audio file
+/// * `target_lufs` - Target loudness in LUFS
+/// * `target_peak_db` - Target peak level in dBTP
+/// * `input_base_dir` - Base directory for input files
+/// * `output_base_dir` - Base directory for output files
+/// * `cache` - Optional cache of pre-measured loudness values
+pub fn process_single_file(
+    input_path: impl AsRef<Path>,
     target_lufs: f64,
     target_peak_db: f64,
-    input_base_dir: &Path,
-    output_base_dir: &Path,
-    cache: &HashMap<PathBuf, Result<f64, MeasurementError>>,
+    input_base_dir: impl AsRef<Path>,
+    output_base_dir: impl AsRef<Path>,
+    cache: &Option<HashMap<PathBuf, Result<f64, MeasurementError>>>,
 ) -> Result<(), Error> {
+    let input_path = input_path.as_ref();
     let file_format: AudioFormats =
         AudioFormats::from_path(input_path).ok_or_else(|| Error::Processing {
             path: input_path.to_path_buf(),
@@ -629,8 +618,8 @@ fn process_single_file(
     debug!("Processing: {}", file_name_str);
 
     // 1. Measure current loudness
-    let current_lufs = match cache.get(input_path) {
-        Some(Ok(lufs_result)) => *lufs_result,
+    let current_lufs = match cache.as_ref().map(|x| x.get(input_path)) {
+        Some(Some(Ok(lufs_result))) => *lufs_result,
         // because MeasurementError is not cloneable, so we cannot deal with Some(Err(e))
         _ => measure_single_file_loudness(input_path).map_err(|e: MeasurementError| {
             Error::Measurement {
@@ -715,7 +704,7 @@ fn process_single_file(
             ),
         })?;
 
-    let mut output_path = output_base_dir.join(relative_path);
+    let mut output_path = output_base_dir.as_ref().join(relative_path);
 
     // Ensure parent directory exists
     if let Some(parent) = output_path.parent() {
@@ -759,11 +748,22 @@ fn process_single_file(
     Ok(())
 }
 
-// Helper to decode, apply gain, and measure peak before limiting
+/// Decodes an audio file, applies gain, and measures the peak level
+///
+/// # Arguments
+/// * `path` - Path to the audio file
+/// * `linear_gain` - Linear gain factor to apply
+///
+/// # Returns
+/// Tuple containing:
+/// - Processed samples in interleaved format
+/// - Signal specifications
+/// - Peak level in dBFS
 fn decode_apply_gain_measure_peak(
-    path: &Path,
+    path: impl AsRef<Path>,
     linear_gain: f64,
 ) -> Result<(Vec<f32>, SignalSpec, f64), anyhow::Error> {
+    let path = path.as_ref();
     let file = fs::File::open(path)?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
     let hint = Hint::new();
@@ -850,7 +850,13 @@ fn decode_apply_gain_measure_peak(
     Ok((interleaved_samples, spec, max_peak_db as f64)) // Return peak as f64
 }
 
-// Helper to convert any Symphonia buffer to Vec<Vec<f32>> (planar)
+/// Converts any Symphonia audio buffer to planar f32 format
+///
+/// # Arguments
+/// * `decoded` - Reference to decoded audio buffer
+///
+/// # Returns
+/// Vector of vectors containing audio data in planar format (one vector per channel)
 fn convert_buffer_to_planar_f32(
     decoded: &AudioBufferRef<'_>,
 ) -> Result<Vec<Vec<f32>>, anyhow::Error> {
@@ -922,7 +928,13 @@ fn convert_buffer_to_planar_f32(
     Ok(planar_output)
 }
 
-// Helper to interleave planar f32 samples
+/// Interleaves planar audio samples into a single vector
+///
+/// # Arguments
+/// * `planar_samples` - Audio data in planar format
+///
+/// # Returns
+/// Vector containing interleaved audio samples
 fn interleave_planar_f32(planar_samples: &[Vec<f32>]) -> Vec<f32> {
     if planar_samples.is_empty() {
         return Vec::new();
@@ -951,4 +963,73 @@ fn interleave_planar_f32(planar_samples: &[Vec<f32>]) -> Vec<f32> {
         }
     }
     interleaved
+}
+
+/// Validates normalization options for correctness
+///
+/// # Arguments
+/// * `options` - Reference to NormalizationOptions struct
+fn validate_options(options: &NormalizationOptions) -> Result<()> {
+    if !options.input_dir.is_dir() {
+        bail!(
+            "Input path is not a valid directory: {:?}",
+            options.input_dir
+        );
+    }
+    if !options.output_dir.exists() {
+        fs::create_dir_all(&options.output_dir).with_context(|| {
+            format!(
+                "Failed to create output directory: {:?}",
+                options.output_dir
+            )
+        })?;
+        info!("Created output directory: {:?}", options.output_dir);
+    } else if !options.output_dir.is_dir() {
+        bail!(
+            "Output path exists but is not a directory: {:?}",
+            options.output_dir
+        );
+    }
+    if !(0.0..0.5).contains(&options.trim_percentage) {
+        bail!("Trim percentage must be between 0.0 and 0.5 (exclusive of 0.5)");
+    }
+    if options.true_peak_db > 0.0 {
+        warn!(
+            "Target true peak {:.1} dBTP is above 0 dBFS. This will likely cause clipping in standard formats.",
+            options.true_peak_db
+        );
+    }
+    Ok(())
+}
+
+/// Finds all supported audio files in the specified directory
+///
+/// # Arguments
+/// * `input_dir` - Directory to search for audio files
+///
+/// # Returns
+/// Vector of AudioFile structs representing found audio files
+fn find_audio_files(input_dir: impl AsRef<Path>) -> Result<Vec<AudioFile>> {
+    let mut audio_files = Vec::new();
+    // Define supported extensions (lowercase)
+
+    for entry in WalkDir::new(input_dir)
+        .into_iter()
+        .filter_map(|e| e.ok()) // Filter out directory reading errors
+        .filter(|e| e.file_type().is_file())
+    {
+        let path = entry.path();
+        if let Some(ext) = path
+            .extension()
+            .and_then(|os| os.to_str())
+            .map(|s| s.to_lowercase())
+        {
+            if AudioFormats::supported_extensions().contains(&ext.as_str()) {
+                audio_files.push(AudioFile {
+                    path: path.to_path_buf(),
+                });
+            }
+        }
+    }
+    Ok(audio_files)
 }
