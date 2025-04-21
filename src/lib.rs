@@ -5,8 +5,8 @@ pub mod save;
 
 use crate::error::{Error, MeasurementError};
 use crate::save::save_as_ogg;
-use anyhow::{Context, Result, anyhow, bail};
 use ebur128::{EbuR128, Mode};
+use error::ProcessingError;
 use indicatif::{ParallelProgressIterator, ProgressBar, ProgressStyle};
 use log::{debug, error, info, warn};
 use rand::seq::IndexedRandom as _;
@@ -110,20 +110,21 @@ struct AudioFile {
 }
 
 /// Main function to normalize the loudness of all audio files in a folder
-pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<()> {
+pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<(), Error> {
     // Configure Rayon thread pool size if specified
     if let Some(num_threads) = options.num_threads {
         if num_threads > 0 {
-            rayon::ThreadPoolBuilder::new()
+            let rayon_init_result = rayon::ThreadPoolBuilder::new()
                 .num_threads(num_threads)
-                .build_global()
-                .with_context(|| {
-                    format!(
-                        "Failed to configure Rayon thread pool with {} threads",
-                        num_threads
-                    )
-                })?;
-            info!("Using {} threads for processing.", num_threads);
+                .build_global();
+            if let Err(e) = rayon_init_result {
+                warn!(
+                    "Failed to configure Rayon thread pool: {}. Using default number of threads.",
+                    e
+                );
+            } else {
+                info!("Using {} threads for processing.", num_threads);
+            }
         } else {
             info!("Using default number of threads.");
         }
@@ -155,7 +156,9 @@ pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<()> {
             // 3. Select sample files
             let sample_size = (all_audio_files.len() as f64 * options.sample_percentage) as usize;
             if sample_size == 0 {
-                bail!("Sample size is 0, please check your sample percentage.");
+                return Err(Error::InvalidOptions(
+                    "Sample size is 0, please check your sample percentage.".to_string(),
+                ));
             }
             let sampled_files: Vec<&AudioFile> = if sample_size >= all_audio_files.len() {
                 all_audio_files.iter().collect()
@@ -174,7 +177,7 @@ pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<()> {
             info!("Measuring loudness of sampled files...");
             let sample_pb = ProgressBar::new(sampled_files.len() as u64);
             sample_pb.set_style(ProgressStyle::default_bar()
-                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}")?
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}").expect("Internal Error: Failed to set progress bar style")
                 .progress_chars("#>-"));
             sample_pb.set_message("Measuring samples");
 
@@ -198,7 +201,11 @@ pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<()> {
 
             // 5. Calculate target loudness (trimmed mean)
             let calculated_target =
-                calculate_target_loudness(&loudness_measurements, options.trim_percentage)?;
+                calculate_target_loudness(&loudness_measurements, options.trim_percentage)
+                    .map_err(|e| Error::Processing {
+                        path: options.input_dir.to_path_buf(),
+                        source: ProcessingError::TargetLoudnessCalculationFailed(e.to_string()),
+                    })?;
             info!(
                 "Calculated Target Loudness ({}% trimmed mean): {:.2} LUFS",
                 options.trim_percentage * 100.0,
@@ -220,7 +227,7 @@ pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<()> {
     );
     let process_pb = ProgressBar::new(all_audio_files.len() as u64);
     process_pb.set_style(ProgressStyle::default_bar()
-        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}")?
+        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}").expect("Internal Error: Failed to set progress bar style")
         .progress_chars("#>-"));
     process_pb.set_message("Processing files");
 
@@ -259,7 +266,10 @@ pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<()> {
     );
 
     if error_count > 0 {
-        bail!("{} files failed during processing.", error_count);
+        Err(Error::Processing {
+            path: options.input_dir.to_path_buf(),
+            source: ProcessingError::FilesFailed(error_count),
+        })
     } else {
         Ok(())
     }
@@ -531,7 +541,7 @@ pub fn measure_single_file_loudness(path: impl AsRef<Path>) -> Result<f64, Measu
 fn calculate_target_loudness(
     measurements: &HashMap<PathBuf, Result<f64, MeasurementError>>,
     trim_percentage: f64,
-) -> Result<f64> {
+) -> Result<f64, ProcessingError> {
     let valid_loudnesses: Vec<f64> = measurements
         .iter()
         .filter_map(|(_, loudness_result)| match loudness_result {
@@ -542,9 +552,10 @@ fn calculate_target_loudness(
         .collect();
 
     if valid_loudnesses.is_empty() {
-        bail!(
+        return Err(ProcessingError::TargetLoudnessCalculationFailed(
             "No valid finite loudness measurements available from the sample to calculate target."
-        );
+                .to_string(),
+        ));
     }
 
     let mut sorted_loudnesses = valid_loudnesses;
@@ -573,7 +584,9 @@ fn calculate_target_loudness(
     if trimmed_slice.is_empty() {
         // This should theoretically not happen if valid_loudnesses was not empty,
         // but handle defensively.
-        bail!("Trimmed slice is empty, cannot calculate target loudness.");
+        return Err(ProcessingError::TargetLoudnessCalculationFailed(
+            "Trimmed slice is empty, cannot calculate target loudness.".to_string(),
+        ));
     }
 
     let sum: f64 = trimmed_slice.iter().sum();
@@ -581,10 +594,10 @@ fn calculate_target_loudness(
 
     // Sanity check the result
     if !mean.is_finite() {
-        bail!(
+        return Err(ProcessingError::TargetLoudnessCalculationFailed(format!(
             "Calculated target loudness is not a finite number ({:.2}). Check input sample measurements.",
             mean
-        );
+        )));
     }
 
     Ok(mean)
@@ -611,7 +624,7 @@ pub fn process_single_file(
     let file_format: AudioFormats =
         AudioFormats::from_path(input_path).ok_or_else(|| Error::Processing {
             path: input_path.to_path_buf(),
-            source: anyhow::anyhow!("Unsupported audio format"),
+            source: error::ProcessingError::UnsupportedFormat,
         })?;
     let file_name_os = input_path.file_name().unwrap_or_default();
     let file_name_str = file_name_os.to_string_lossy();
@@ -762,7 +775,7 @@ pub fn process_single_file(
 fn decode_apply_gain_measure_peak(
     path: impl AsRef<Path>,
     linear_gain: f64,
-) -> Result<(Vec<f32>, SignalSpec, f64), anyhow::Error> {
+) -> Result<(Vec<f32>, SignalSpec, f64), ProcessingError> {
     let path = path.as_ref();
     let file = fs::File::open(path)?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
@@ -776,17 +789,17 @@ fn decode_apply_gain_measure_peak(
         .tracks()
         .iter()
         .find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL)
-        .ok_or_else(|| anyhow!("No compatible audio track found in {:?}", path))?;
+        .ok_or_else(|| ProcessingError::NoTrack(path.to_path_buf()))?;
 
     let spec = SignalSpec::new(
         track
             .codec_params
             .sample_rate
-            .ok_or(anyhow!("Missing sample rate"))?,
+            .ok_or(ProcessingError::MissingSampleRate)?,
         track
             .codec_params
             .channels
-            .ok_or(anyhow!("Missing channel spec"))?,
+            .ok_or(ProcessingError::MissingChannelSpec)?,
     );
 
     let dec_opts: DecoderOptions = Default::default();
@@ -825,7 +838,7 @@ fn decode_apply_gain_measure_peak(
                     {
                         break;
                     }
-                    Err(e) => bail!("Decoder error: {}", e),
+                    Err(e) => return Err(ProcessingError::Symphonia(e)),
                 }
             }
             Err(SymphoniaError::IoError(ref e))
@@ -833,7 +846,7 @@ fn decode_apply_gain_measure_peak(
             {
                 break;
             }
-            Err(e) => bail!("Format reader error: {}", e),
+            Err(e) => return Err(ProcessingError::Symphonia(e)),
         }
     }
 
@@ -859,7 +872,7 @@ fn decode_apply_gain_measure_peak(
 /// Vector of vectors containing audio data in planar format (one vector per channel)
 fn convert_buffer_to_planar_f32(
     decoded: &AudioBufferRef<'_>,
-) -> Result<Vec<Vec<f32>>, anyhow::Error> {
+) -> Result<Vec<Vec<f32>>, ProcessingError> {
     let num_channels = decoded.spec().channels.count();
     let mut planar_output: Vec<Vec<f32>> = Vec::with_capacity(num_channels);
 
@@ -923,7 +936,7 @@ fn convert_buffer_to_planar_f32(
                 );
             }
         }
-        _ => bail!("Unsupported audio buffer format for conversion"),
+        _ => return Err(ProcessingError::UnsupportedFormat),
     }
     Ok(planar_output)
 }
@@ -969,29 +982,30 @@ fn interleave_planar_f32(planar_samples: &[Vec<f32>]) -> Vec<f32> {
 ///
 /// # Arguments
 /// * `options` - Reference to NormalizationOptions struct
-fn validate_options(options: &NormalizationOptions) -> Result<()> {
+fn validate_options(options: &NormalizationOptions) -> Result<(), Error> {
     if !options.input_dir.is_dir() {
-        bail!(
+        return Err(Error::InvalidOptions(format!(
             "Input path is not a valid directory: {:?}",
             options.input_dir
-        );
+        )));
     }
     if !options.output_dir.exists() {
-        fs::create_dir_all(&options.output_dir).with_context(|| {
-            format!(
-                "Failed to create output directory: {:?}",
-                options.output_dir
-            )
+        fs::create_dir_all(&options.output_dir).map_err(|e| Error::Io {
+            path: options.output_dir.to_path_buf(),
+            source: e,
         })?;
         info!("Created output directory: {:?}", options.output_dir);
     } else if !options.output_dir.is_dir() {
-        bail!(
+        return Err(Error::InvalidOptions(format!(
             "Output path exists but is not a directory: {:?}",
             options.output_dir
-        );
+        )));
     }
     if !(0.0..0.5).contains(&options.trim_percentage) {
-        bail!("Trim percentage must be between 0.0 and 0.5 (exclusive of 0.5)");
+        return Err(Error::InvalidOptions(format!(
+            "Trim percentage must be between 0.0 and 0.5 (exclusive of 0.5): {}",
+            options.trim_percentage
+        )));
     }
     if options.true_peak_db > 0.0 {
         warn!(
@@ -1009,7 +1023,7 @@ fn validate_options(options: &NormalizationOptions) -> Result<()> {
 ///
 /// # Returns
 /// Vector of AudioFile structs representing found audio files
-fn find_audio_files(input_dir: impl AsRef<Path>) -> Result<Vec<AudioFile>> {
+fn find_audio_files(input_dir: impl AsRef<Path>) -> Result<Vec<AudioFile>, Error> {
     let mut audio_files = Vec::new();
     // Define supported extensions (lowercase)
 

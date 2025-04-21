@@ -2,7 +2,9 @@ use anyhow::Result;
 use audio_loudness_batch_normalize::{NormalizationOptions, normalize_folder_loudness};
 use clap::Parser;
 use log::{error, info};
+use path_absolutize::Absolutize as _;
 use std::path::PathBuf;
+use tap::Tap;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -47,18 +49,18 @@ fn main() -> Result<()> {
 
     // --- Configuration ---
     let options = NormalizationOptions {
-        output_dir: cli.output.unwrap_or(
-            cli.input
-                .with_file_name(
-                    cli.input
-                        .file_name()
+        output_dir: cli
+            .output
+            .unwrap_or(cli.input.absolutize()?.into_owned().tap_mut(|x| {
+                x.set_file_name(
+                    x.file_name()
                         .unwrap_or_default()
-                        .to_string_lossy()
-                        .into_owned()
-                        + "_normalized",
+                        .to_os_string()
+                        .tap_mut(|x| {
+                            x.push("_normalized");
+                        }),
                 )
-                .to_path_buf(),
-        ),
+            })),
         input_dir: cli.input,
         sample_percentage: cli.sample_percentage,
         trim_percentage: cli.trim_percentage,
@@ -95,13 +97,7 @@ fn main() -> Result<()> {
         }
         Err(e) => {
             error!("Normalization failed: {}", e);
-            // Print underlying causes if available
-            let mut source = e.source();
-            while let Some(cause) = source {
-                error!("  Caused by: {}", cause);
-                source = cause.source();
-            }
-            Err(e)
+            Err(e)?
         }
     }
 }

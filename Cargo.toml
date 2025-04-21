@@ -8,30 +8,34 @@ license     = "MIT"
 name        = "audio-loudness-batch-normalize"
 readme      = "README.md"
 repository  = "https://github.com/lxl66566/audio-loudness-batch-normalize"
-version     = "0.1.1"
+version     = "0.1.2"
 
 [dependencies]
-anyhow            = "1.0"
-clap              = { version = "4.5", features = ["derive"] }
+anyhow            = { version = "1.0", optional = true }
+clap              = { version = "4.5", features = ["derive"], optional = true }
 ebur128           = "0.1"
 hound             = "3.5"
 indicatif         = { version = "0.17", features = ["rayon"] }
 log               = "0.4"
-num-traits        = "0.2"
+path-absolutize   = { version = "3.1.1", optional = true }
 pathdiff          = "0.2"
 pretty_env_logger = "0.5"
 rand              = "0.9"
 rayon             = "1.8"
-strum             = "0.27"
 strum_macros      = "0.27"
 symphonia         = { version = "0.5", features = ["all-codecs", "all-formats"] }
+tap               = { version = "1.0.1", optional = true }
 thiserror         = "2.0"
 vorbis_rs         = "0.5"
 walkdir           = "2"
 
+[features]
+bin = ["path-absolutize", "clap", "tap", "anyhow"]
+
 [[bin]]
-name = "loudness-normalize"
-path = "src/main.rs"
+name              = "loudness-normalize"
+path              = "src/main.rs"
+required-features = ["bin"]
 
 [profile.release]
 lto       = true

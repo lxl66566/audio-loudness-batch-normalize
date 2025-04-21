@@ -1,7 +1,7 @@
 use std::path::PathBuf;
-
 use symphonia::core::errors::Error as SymphoniaError;
 
+#[warn(dead_code)]
 #[derive(thiserror::Error, Debug)]
 pub enum MeasurementError {
     #[error("Symphonia error: {0}")]
@@ -14,10 +14,9 @@ pub enum MeasurementError {
     NoTrack,
     #[error("Unsupported sample format")]
     UnsupportedFormat,
-    #[error("Other error: {0}")]
-    Other(#[from] anyhow::Error),
 }
 
+#[warn(dead_code)]
 #[derive(thiserror::Error, Debug)]
 pub enum WritingError {
     #[error("Writing wav Error: {0}")]
@@ -28,6 +27,28 @@ pub enum WritingError {
     Io(#[from] std::io::Error),
 }
 
+#[warn(dead_code)]
+#[derive(thiserror::Error, Debug)]
+pub enum ProcessingError {
+    #[error("Symphonia error: {0}")]
+    Symphonia(#[from] SymphoniaError),
+    #[error("No compatible audio track found in {0:?}")]
+    NoTrack(PathBuf),
+    #[error("Missing sample rate")]
+    MissingSampleRate,
+    #[error("Missing channel specification")]
+    MissingChannelSpec,
+    #[error("Unsupported audio buffer format")]
+    UnsupportedFormat,
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("{0} files failed during processing")]
+    FilesFailed(usize),
+    #[error("Target loudness calculation failed: {0}")]
+    TargetLoudnessCalculationFailed(String),
+}
+
+#[warn(dead_code)]
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("Measurement failed: {source}")]
@@ -40,7 +61,7 @@ pub enum Error {
     Processing {
         path: PathBuf,
         #[source]
-        source: anyhow::Error, // Catch-all for symphonia/hound during processing
+        source: ProcessingError,
     },
     #[error("Audio writing failed for {path}: {source}")]
     Writing {
@@ -54,4 +75,6 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
+    #[error("Invalid options: {0}")]
+    InvalidOptions(String),
 }
