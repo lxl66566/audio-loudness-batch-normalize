@@ -2,9 +2,7 @@ use anyhow::Result;
 use audio_loudness_batch_normalize::{NormalizationOptions, normalize_folder_loudness};
 use clap::Parser;
 use log::{error, info};
-use path_absolutize::Absolutize as _;
 use std::path::PathBuf;
-use tap::Tap;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -12,7 +10,7 @@ struct Cli {
     /// input directory
     input: PathBuf,
 
-    /// output directory, default to `*_normalized` in the same directory as input
+    /// output directory, default to override input audios
     #[arg(short, long)]
     output: Option<PathBuf>,
 
@@ -49,18 +47,7 @@ fn main() -> Result<()> {
 
     // --- Configuration ---
     let options = NormalizationOptions {
-        output_dir: cli
-            .output
-            .unwrap_or(cli.input.absolutize()?.into_owned().tap_mut(|x| {
-                x.set_file_name(
-                    x.file_name()
-                        .unwrap_or_default()
-                        .to_os_string()
-                        .tap_mut(|x| {
-                            x.push("_normalized");
-                        }),
-                )
-            })),
+        output_dir: cli.output,
         input_dir: cli.input,
         sample_percentage: cli.sample_percentage,
         trim_percentage: cli.trim_percentage,

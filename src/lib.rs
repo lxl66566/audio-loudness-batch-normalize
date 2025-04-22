@@ -75,8 +75,8 @@ impl AudioFormats {
 pub struct NormalizationOptions {
     /// Input directory containing audio files to process
     pub input_dir: PathBuf,
-    /// Output directory for normalized audio files
-    pub output_dir: PathBuf,
+    /// Output directory for normalized audio files. If not set, override the audio in input dir.
+    pub output_dir: Option<PathBuf>,
     /// Percentage of files to sample for calculating target loudness (0.0 to 1.0)
     pub sample_percentage: f64,
     /// Percentage of measurements to trim when calculating average loudness (0.0 to 0.5)
@@ -93,7 +93,7 @@ impl Default for NormalizationOptions {
     fn default() -> Self {
         NormalizationOptions {
             input_dir: PathBuf::from("."),
-            output_dir: PathBuf::from("./normalized_output"),
+            output_dir: None,
             sample_percentage: 0.30,
             trim_percentage: 0.30,
             target_lufs: None,
@@ -109,7 +109,7 @@ struct AudioFile {
     path: PathBuf,
 }
 
-/// Main function to normalize the loudness of all audio files in a folder
+/// Normalize the loudness of all audio files in a folder
 pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<(), Error> {
     // Configure Rayon thread pool size if specified
     if let Some(num_threads) = options.num_threads {
@@ -274,8 +274,6 @@ pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<(), E
         Ok(())
     }
 }
-
-// --- Helper Functions ---
 
 /// Updates RMS (Root Mean Square) accumulators for audio data
 ///
@@ -610,14 +608,14 @@ fn calculate_target_loudness(
 /// * `target_lufs` - Target loudness in LUFS
 /// * `target_peak_db` - Target peak level in dBTP
 /// * `input_base_dir` - Base directory for input files
-/// * `output_base_dir` - Base directory for output files
+/// * `output_base_dir` - Base directory for output files. If not set, use
 /// * `cache` - Optional cache of pre-measured loudness values
 pub fn process_single_file(
     input_path: impl AsRef<Path>,
     target_lufs: f64,
     target_peak_db: f64,
     input_base_dir: impl AsRef<Path>,
-    output_base_dir: impl AsRef<Path>,
+    output_base_dir: &Option<impl AsRef<Path>>,
     cache: &Option<HashMap<PathBuf, Result<f64, MeasurementError>>>,
 ) -> Result<(), Error> {
     let input_path = input_path.as_ref();
@@ -708,16 +706,20 @@ pub fn process_single_file(
     debug!("  -> Final Combined Linear Gain: {:.3}x", final_linear_gain);
 
     // 6. Determine output path
-    let relative_path =
-        pathdiff::diff_paths(input_path, input_base_dir).ok_or_else(|| Error::Io {
-            path: input_path.to_path_buf(),
-            source: std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Failed to calculate relative path",
-            ),
-        })?;
-
-    let mut output_path = output_base_dir.as_ref().join(relative_path);
+    let mut output_path = match output_base_dir.as_ref() {
+        Some(obd) => {
+            let relative_path =
+                pathdiff::diff_paths(input_path, input_base_dir).ok_or_else(|| Error::Io {
+                    path: input_path.to_path_buf(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "Failed to calculate relative path",
+                    ),
+                })?;
+            obd.as_ref().join(relative_path)
+        }
+        None => input_path.to_path_buf(),
+    };
 
     // Ensure parent directory exists
     if let Some(parent) = output_path.parent() {
@@ -989,18 +991,21 @@ fn validate_options(options: &NormalizationOptions) -> Result<(), Error> {
             options.input_dir
         )));
     }
-    if !options.output_dir.exists() {
-        fs::create_dir_all(&options.output_dir).map_err(|e| Error::Io {
-            path: options.output_dir.to_path_buf(),
-            source: e,
-        })?;
-        info!("Created output directory: {:?}", options.output_dir);
-    } else if !options.output_dir.is_dir() {
-        return Err(Error::InvalidOptions(format!(
-            "Output path exists but is not a directory: {:?}",
-            options.output_dir
-        )));
+    if let Some(output_dir) = &options.output_dir {
+        if !output_dir.exists() {
+            fs::create_dir_all(output_dir).map_err(|e| Error::Io {
+                path: output_dir.to_path_buf(),
+                source: e,
+            })?;
+            info!("Created output directory: {:?}", output_dir);
+        } else if !output_dir.is_dir() {
+            return Err(Error::InvalidOptions(format!(
+                "Output path exists but is not a directory: {:?}",
+                output_dir
+            )));
+        }
     }
+
     if !(0.0..0.5).contains(&options.trim_percentage) {
         return Err(Error::InvalidOptions(format!(
             "Trim percentage must be between 0.0 and 0.5 (exclusive of 0.5): {}",

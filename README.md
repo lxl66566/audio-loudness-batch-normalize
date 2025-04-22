@@ -32,7 +32,7 @@ Options:
 
 ```
 <input_directory>                     Input directory for audio files
--o, --output <path>                   Output directory (default: {input_directory}_normalized)
+-o, --output <path>                   Output directory (default: override input audios)
 -s, --sample-percentage <float>       Percentage of files to sample (default: 1.00, samples all audio files)
 -t, --trim-percentage <float>         Trimming percentage for averaging (default: 0.30, removes the highest 15% and lowest 15%)
     --target-lufs <float>             Target loudness value (LUFS) (default: auto-calculated)

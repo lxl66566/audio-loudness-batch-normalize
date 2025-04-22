@@ -17,20 +17,18 @@ ebur128           = "0.1"
 hound             = "3.5"
 indicatif         = { version = "0.17", features = ["rayon"] }
 log               = "0.4"
-path-absolutize   = { version = "3.1.1", optional = true }
 pathdiff          = "0.2"
 pretty_env_logger = "0.5"
 rand              = "0.9"
 rayon             = "1.8"
 strum_macros      = "0.27"
 symphonia         = { version = "0.5", features = ["all-codecs", "all-formats"] }
-tap               = { version = "1.0.1", optional = true }
 thiserror         = "2.0"
 vorbis_rs         = "0.5"
 walkdir           = "2"
 
 [features]
-bin = ["path-absolutize", "clap", "tap", "anyhow"]
+bin = ["clap", "anyhow"]
 
 [[bin]]
 name              = "loudness-normalize"
