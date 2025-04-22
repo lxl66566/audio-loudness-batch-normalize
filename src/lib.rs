@@ -731,7 +731,6 @@ pub fn process_single_file(
 
     match file_format {
         AudioFormats::Ogg => {
-            output_path.set_extension(file_format.to_string());
             save_as_ogg(
                 &output_path,
                 spec.channels.count(),
@@ -745,7 +744,9 @@ pub fn process_single_file(
         }
         // All other formats fallback to wav
         _ => {
-            output_path.set_extension("wav");
+            if !matches!(file_format, AudioFormats::Wav) {
+                output_path.set_extension("wav");
+            }
             save_as_wav(
                 &output_path,
                 spec.channels.count(),
