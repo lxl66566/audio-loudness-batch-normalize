@@ -19,7 +19,7 @@ struct Cli {
     sample_percentage: f64,
 
     /// trim percentage for calculating target loudness
-    #[arg(short, long, default_value_t = 0.30)]
+    #[arg(long, default_value_t = 0.30)]
     trim_percentage: f64,
 
     /// target loudness in LUFS, default to automatic calculation
