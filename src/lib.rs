@@ -26,8 +26,8 @@ use symphonia::core::{
 use walkdir::WalkDir;
 
 use crate::{
-    error::{Error, MeasurementError, ProcessingError, WritingError},
-    save::save_as_ogg,
+    error::{Error, MeasurementError, ProcessingError},
+    save::{stream_to_ogg_writer, stream_to_wav_writer},
 };
 
 /// Represents supported audio file formats
@@ -522,162 +522,27 @@ fn decode_apply_gain_and_save(
     // --- Set up the writer based on format ---
     match file_format {
         AudioFormats::Ogg => {
-            // OGG saving still requires collecting all samples due to vorbis-rs API.
-            // This is the main memory exception in the new architecture.
-            let samples = collect_gained_samples(&mut *format, &mut *decoder, final_linear_gain)?;
-            save_as_ogg(output_path, spec.channels.count(), spec.rate, &samples).map_err(|e| {
-                Error::Writing {
-                    path: output_path.to_path_buf(),
-                    source: e,
-                }
-            })?;
+            stream_to_ogg_writer(
+                &mut *format,
+                &mut *decoder,
+                final_linear_gain,
+                output_path,
+                spec,
+            )?;
         }
         // All other formats are saved as WAV in a streaming fashion.
         _ => {
-            let hound_spec = hound::WavSpec {
-                channels: spec.channels.count() as u16,
-                sample_rate: spec.rate,
-                bits_per_sample: 32,
-                sample_format: hound::SampleFormat::Float,
-            };
-            let writer =
-                hound::WavWriter::create(output_path, hound_spec).map_err(|e| Error::Writing {
-                    path: output_path.to_path_buf(),
-                    source: WritingError::Wav(e),
-                })?;
-
-            stream_to_wav_writer(&mut *format, &mut *decoder, writer, final_linear_gain)?;
+            stream_to_wav_writer(
+                &mut *format,
+                &mut *decoder,
+                final_linear_gain,
+                output_path,
+                spec,
+            )?;
         }
     }
 
     Ok(())
-}
-
-/// Helper for `decode_apply_gain_and_save`: streams processed data directly to
-/// a WAV writer.
-fn stream_to_wav_writer(
-    format: &mut dyn symphonia::core::formats::FormatReader,
-    decoder: &mut dyn symphonia::core::codecs::Decoder,
-    mut writer: hound::WavWriter<std::io::BufWriter<fs::File>>,
-    final_linear_gain: f64,
-) -> Result<(), Error> {
-    loop {
-        match format.next_packet() {
-            Ok(packet) => match decoder.decode(&packet) {
-                Ok(decoded) => {
-                    let planar =
-                        convert_buffer_to_planar_f32(&decoded).map_err(|e| Error::Processing {
-                            path: PathBuf::new(), // Path context is higher up
-                            source: e,
-                        })?;
-
-                    if planar.is_empty() || planar[0].is_empty() {
-                        continue;
-                    }
-
-                    let num_frames = planar[0].len();
-                    let num_channels = planar.len();
-
-                    for frame_idx in 0..num_frames {
-                        for channel_idx in 0..num_channels {
-                            let sample = planar[channel_idx][frame_idx];
-                            let processed_sample = sample * final_linear_gain as f32;
-                            writer
-                                .write_sample(processed_sample)
-                                .map_err(|e| Error::Writing {
-                                    path: PathBuf::new(), // Path context is higher up
-                                    source: WritingError::Wav(e),
-                                })?;
-                        }
-                    }
-                }
-                Err(SymphoniaError::DecodeError(e)) => {
-                    warn!("Decode error during final write: {e}")
-                }
-                Err(e) => {
-                    return Err(Error::Processing {
-                        path: PathBuf::new(),
-                        source: e.into(),
-                    });
-                }
-            },
-            Err(SymphoniaError::IoError(ref e))
-                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-            {
-                break;
-            }
-            Err(e) => {
-                return Err(Error::Processing {
-                    path: PathBuf::new(),
-                    source: e.into(),
-                });
-            }
-        }
-    }
-    writer.finalize().map_err(|e| Error::Writing {
-        path: PathBuf::new(),
-        source: WritingError::Wav(e),
-    })
-}
-
-/// Helper for `decode_apply_gain_and_save`: collects all processed samples into
-/// a Vec. Used for formats that don't support streaming writes with the current
-/// libraries (e.g., Ogg).
-fn collect_gained_samples(
-    format: &mut dyn symphonia::core::formats::FormatReader,
-    decoder: &mut dyn symphonia::core::codecs::Decoder,
-    final_linear_gain: f64,
-) -> Result<Vec<f32>, Error> {
-    let mut all_samples_interleaved = Vec::new();
-    loop {
-        match format.next_packet() {
-            Ok(packet) => match decoder.decode(&packet) {
-                Ok(decoded) => {
-                    let planar =
-                        convert_buffer_to_planar_f32(&decoded).map_err(|e| Error::Processing {
-                            path: PathBuf::new(),
-                            source: e,
-                        })?;
-
-                    if planar.is_empty() || planar[0].is_empty() {
-                        continue;
-                    }
-
-                    let num_frames = planar[0].len();
-                    let num_channels = planar.len();
-
-                    for frame_idx in 0..num_frames {
-                        for channel_idx in 0..num_channels {
-                            let sample = planar[channel_idx][frame_idx];
-                            let processed_sample = sample * final_linear_gain as f32;
-                            all_samples_interleaved.push(processed_sample);
-                        }
-                    }
-                }
-                Err(SymphoniaError::DecodeError(e)) => {
-                    warn!("Decode error during sample collection: {e}")
-                }
-                Err(e) => {
-                    return Err(Error::Processing {
-                        path: PathBuf::new(),
-                        source: e.into(),
-                    });
-                }
-            },
-            Err(SymphoniaError::IoError(ref e))
-                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-            {
-                break;
-            }
-            Err(e) => {
-                return Err(Error::Processing {
-                    path: PathBuf::new(),
-                    source: e.into(),
-                });
-            }
-        }
-    }
-    Ok(all_samples_interleaved)
 }
 
 /// Measures the loudness of a single audio file using EBU R128 or RMS fallback
@@ -947,12 +812,11 @@ fn find_audio_files(input_dir: impl AsRef<Path>) -> Result<Vec<AudioFile>, Error
             .extension()
             .and_then(|os| os.to_str())
             .map(|s| s.to_lowercase())
+            && AudioFormats::supported_extensions().contains(&ext.as_str())
         {
-            if AudioFormats::supported_extensions().contains(&ext.as_str()) {
-                audio_files.push(AudioFile {
-                    path: path.to_path_buf(),
-                });
-            }
+            audio_files.push(AudioFile {
+                path: path.to_path_buf(),
+            });
         }
     }
     Ok(audio_files)
