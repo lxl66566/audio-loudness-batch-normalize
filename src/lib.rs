@@ -704,9 +704,7 @@ pub fn process_single_file(
             let relative_path =
                 pathdiff::diff_paths(input_path, input_base_dir).ok_or_else(|| Error::Io {
                     path: input_path.to_path_buf(),
-                    source: std::io::Error::other(
-                        "Failed to calculate relative path",
-                    ),
+                    source: std::io::Error::other("Failed to calculate relative path"),
                 })?;
             obd.as_ref().join(relative_path)
         }
@@ -763,6 +761,7 @@ pub fn process_single_file(
 /// * `linear_gain` - Linear gain factor to apply
 ///
 /// # Returns
+///
 /// Tuple containing:
 /// - Processed samples in interleaved format
 /// - Signal specifications
@@ -800,31 +799,41 @@ fn decode_apply_gain_measure_peak(
     let dec_opts: DecoderOptions = Default::default();
     let mut decoder = symphonia::default::get_codecs().make(&track.codec_params, &dec_opts)?;
 
-    let mut all_samples_planar: Vec<Vec<f32>> = Vec::with_capacity(spec.channels.count());
-    for _ in 0..spec.channels.count() {
+    let sample_rate = spec.rate;
+    let channels_count = spec.channels.count();
+    let mut all_samples_planar: Vec<Vec<f32>> = Vec::with_capacity(channels_count);
+    for _ in 0..channels_count {
         all_samples_planar.push(Vec::new());
     }
-    let mut max_peak_linear: f32 = 0.0;
+
+    // Initialize EBU R128 for true peak measurement
+    let mut ebu_state_true_peak = EbuR128::new(channels_count as u32, sample_rate, Mode::TRUE_PEAK)
+        .map_err(ProcessingError::EbuR128)?;
 
     loop {
         match format.next_packet() {
             Ok(packet) => {
                 match decoder.decode(&packet) {
                     Ok(decoded) => {
-                        // Convert buffer to planar f32
                         let current_planar = convert_buffer_to_planar_f32(&decoded)?;
 
-                        // Append samples and find peak *after* applying gain
-                        for (channel_idx, plane) in current_planar.iter().enumerate() {
-                            for &sample in plane {
-                                let gained_sample = sample * linear_gain as f32;
-                                all_samples_planar[channel_idx].push(gained_sample);
-                                // Track peak of the absolute value
-                                let abs_sample = gained_sample.abs();
-                                if abs_sample > max_peak_linear {
-                                    max_peak_linear = abs_sample;
-                                }
-                            }
+                        // Apply gain and collect samples for interleaving
+                        let mut gained_planar: Vec<Vec<f32>> = Vec::with_capacity(channels_count);
+                        for plane in current_planar.iter() {
+                            gained_planar
+                                .push(plane.iter().map(|&s| s * linear_gain as f32).collect());
+                        }
+
+                        // Feed EBU R128 for true peak measurement
+                        let plane_slices: Vec<&[f32]> =
+                            gained_planar.iter().map(|v| v.as_slice()).collect();
+                        ebu_state_true_peak
+                            .add_frames_planar_f32(&plane_slices)
+                            .map_err(ProcessingError::EbuR128)?;
+
+                        // Append gained samples to all_samples_planar for final output
+                        for (channel_idx, plane) in gained_planar.into_iter().enumerate() {
+                            all_samples_planar[channel_idx].extend(plane);
                         }
                     }
                     Err(SymphoniaError::DecodeError(e)) => warn!("Decode error: {e}"),
@@ -848,14 +857,18 @@ fn decode_apply_gain_measure_peak(
     // Interleave the processed samples
     let interleaved_samples = interleave_planar_f32(&all_samples_planar);
 
-    // Convert max linear peak to dBFS
-    let max_peak_db = if max_peak_linear > 0.0 {
-        20.0 * max_peak_linear.log10()
-    } else {
-        f32::NEG_INFINITY // Represents silence or zero signal
-    };
+    // Get true peak from EBU R128 state for each channel and find the maximum
+    let mut max_true_peak_db = f64::NEG_INFINITY;
+    for i in 0..channels_count {
+        let channel_true_peak = ebu_state_true_peak
+            .true_peak(i as u32)
+            .map_err(ProcessingError::EbuR128)?;
+        if channel_true_peak > max_true_peak_db {
+            max_true_peak_db = channel_true_peak;
+        }
+    }
 
-    Ok((interleaved_samples, spec, max_peak_db as f64)) // Return peak as f64
+    Ok((interleaved_samples, spec, max_true_peak_db))
 }
 
 /// Converts any Symphonia audio buffer to planar f32 format

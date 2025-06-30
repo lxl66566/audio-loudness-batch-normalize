@@ -46,6 +46,8 @@ pub enum ProcessingError {
     FilesFailed(usize),
     #[error("Target loudness calculation failed: {0}")]
     TargetLoudnessCalculationFailed(String),
+    #[error("EBU R128 error: {0}")]
+    EbuR128(#[from] ebur128::Error),
 }
 
 #[warn(dead_code)]
