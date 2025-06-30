@@ -1,32 +1,37 @@
+#![allow(clippy::needless_range_loop)]
+
 /// Module for error handling
 pub mod error;
 /// Module for saving audio files
 pub mod save;
 
-use crate::error::{Error, MeasurementError};
-use crate::save::save_as_ogg;
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+};
+
 use ebur128::{EbuR128, Mode};
-use error::ProcessingError;
 use indicatif::{ParallelProgressIterator, ProgressBar, ProgressStyle};
 use log::{debug, error, info, warn};
 use rand::seq::IndexedRandom as _;
 use rayon::prelude::*;
-use save::save_as_wav;
-use std::collections::HashMap;
-use std::fs;
-use std::path::{Path, PathBuf};
 use strum_macros::Display;
-use symphonia::core::audio::{AudioBufferRef, SignalSpec};
-use symphonia::core::codecs::DecoderOptions;
-use symphonia::core::errors::Error as SymphoniaError;
-use symphonia::core::formats::FormatOptions;
-use symphonia::core::io::MediaSourceStream;
-use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
+use symphonia::core::{
+    audio::{AudioBufferRef, SignalSpec},
+    errors::Error as SymphoniaError,
+    io::MediaSourceStream,
+    probe::Hint,
+};
 use walkdir::WalkDir;
 
+use crate::{
+    error::{Error, MeasurementError, ProcessingError, WritingError},
+    save::save_as_ogg,
+};
+
 /// Represents supported audio file formats
-#[derive(Debug, PartialEq, Display)]
+#[derive(Debug, PartialEq, Display, Clone)]
 #[strum(serialize_all = "camelCase")]
 pub enum AudioFormats {
     Wav,
@@ -75,11 +80,14 @@ impl AudioFormats {
 pub struct NormalizationOptions {
     /// Input directory containing audio files to process
     pub input_dir: PathBuf,
-    /// Output directory for normalized audio files. If not set, override the audio in input dir.
+    /// Output directory for normalized audio files. If not set, override the
+    /// audio in input dir.
     pub output_dir: Option<PathBuf>,
-    /// Percentage of files to sample for calculating target loudness (0.0 to 1.0)
+    /// Percentage of files to sample for calculating target loudness (0.0 to
+    /// 1.0)
     pub sample_percentage: f64,
-    /// Percentage of measurements to trim when calculating average loudness (0.0 to 0.5)
+    /// Percentage of measurements to trim when calculating average loudness
+    /// (0.0 to 0.5)
     pub trim_percentage: f64,
     /// Target loudness in LUFS (Loudness Units Full Scale)
     pub target_lufs: Option<f64>,
@@ -111,7 +119,6 @@ struct AudioFile {
 
 /// Normalize the loudness of all audio files in a folder
 pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<(), Error> {
-    // Configure Rayon thread pool size if specified
     if let Some(num_threads) = options.num_threads {
         if num_threads > 0 {
             let rayon_init_result = rayon::ThreadPoolBuilder::new()
@@ -153,7 +160,8 @@ pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<(), E
         }
         None => {
             // 3. Select sample files
-            let sample_size = (all_audio_files.len() as f64 * options.sample_percentage) as usize;
+            let sample_size =
+                (all_audio_files.len() as f64 * options.sample_percentage).ceil() as usize;
             if sample_size == 0 {
                 return Err(Error::InvalidOptions(
                     "Sample size is 0, please check your sample percentage.".to_string(),
@@ -203,7 +211,7 @@ pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<(), E
                 calculate_target_loudness(&loudness_measurements, options.trim_percentage)
                     .map_err(|e| Error::Processing {
                         path: options.input_dir.to_path_buf(),
-                        source: ProcessingError::TargetLoudnessCalculationFailed(e.to_string()),
+                        source: e,
                     })?;
             info!(
                 "Calculated Target Loudness ({}% trimmed mean): {:.2} LUFS",
@@ -259,9 +267,7 @@ pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<(), E
         }
     }
 
-    info!(
-        "Processing complete. {success_count} files succeeded, {error_count} files failed."
-    );
+    info!("Processing complete. {success_count} files succeeded, {error_count} files failed.");
 
     if error_count > 0 {
         Err(Error::Processing {
@@ -273,339 +279,8 @@ pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<(), E
     }
 }
 
-/// Updates RMS (Root Mean Square) accumulators for audio data
-///
-/// # Arguments
-/// * `planar_f32` - Audio data in planar format (separate channels)
-/// * `sum_of_squares` - Accumulator for sum of squared samples
-/// * `total_samples` - Counter for total number of samples processed
-fn update_rms_accumulators(
-    planar_f32: &[Vec<f32>],
-    sum_of_squares: &mut f64,
-    total_samples: &mut u64,
-) {
-    for channel_buffer in planar_f32 {
-        for sample in channel_buffer {
-            *sum_of_squares += (*sample as f64) * (*sample as f64);
-        }
-        // Increment total_samples by the number of samples in this channel buffer
-        // Assumes all channel buffers have the same length for a given frame decode
-    }
-    // Add samples for the first channel only if channels exist,
-    // assuming all channels have equal length per decode step
-    if let Some(first_channel_buffer) = planar_f32.first() {
-        *total_samples += first_channel_buffer.len() as u64;
-    }
-}
-
-/// Calculates RMS (Root Mean Square) value in dBFS (decibels Full Scale)
-///
-/// # Arguments
-/// * `sum_of_squares` - Sum of squared samples
-/// * `total_samples` - Total number of samples
-///
-/// # Returns
-/// RMS value in dBFS, or negative infinity for silence
-fn calculate_rms_dbfs(sum_of_squares: f64, total_samples: u64) -> f64 {
-    if total_samples == 0 {
-        return f64::NEG_INFINITY; // No samples, effectively silence
-    }
-    let mean_square = sum_of_squares / total_samples as f64;
-    if mean_square <= 0.0 {
-        return f64::NEG_INFINITY; // Silence or numerical issue
-    }
-    let rms = mean_square.sqrt();
-
-    // Convert RMS to dBFS (decibels relative to full scale)
-    // Clamp RMS to avoid log10(0) or log10(negative)
-    20.0 * rms.max(f32::EPSILON as f64).log10()
-}
-
-/// Measures the loudness of a single audio file using EBU R128 or RMS fallback
-///
-/// # Arguments
-/// * `path` - Path to the audio file
-///
-/// # Returns
-/// Measured loudness in LUFS (Loudness Units Full Scale) or dBFS if fallback to RMS
-pub fn measure_single_file_loudness(path: impl AsRef<Path>) -> Result<f64, MeasurementError> {
-    let path = path.as_ref();
-    let file = fs::File::open(path).map_err(MeasurementError::Io)?;
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
-    let hint = Hint::new();
-    let meta_opts: MetadataOptions = Default::default();
-    let fmt_opts: FormatOptions = Default::default();
-
-    let probed = symphonia::default::get_probe()
-        .format(&hint, mss, &fmt_opts, &meta_opts)
-        .map_err(MeasurementError::Symphonia)?;
-
-    let mut format = probed.format;
-
-    let track = format
-        .tracks()
-        .iter()
-        .find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL)
-        .ok_or(MeasurementError::NoTrack)?;
-
-    let sample_rate = track
-        .codec_params
-        .sample_rate
-        .ok_or(MeasurementError::UnsupportedFormat)?;
-    let channels = track
-        .codec_params
-        .channels
-        .ok_or(MeasurementError::UnsupportedFormat)?;
-    let channel_count = channels.count();
-
-    // Create EBU R128 state
-    let mut ebu_state = EbuR128::new(channel_count as u32, sample_rate, Mode::I)
-        .map_err(MeasurementError::EbuR128)?;
-
-    let dec_opts: DecoderOptions = Default::default();
-    let mut decoder = symphonia::default::get_codecs()
-        .make(&track.codec_params, &dec_opts)
-        .map_err(MeasurementError::Symphonia)?;
-
-    let mut packet_count = 0;
-    let mut decoded_frames_count = 0; // Use a more descriptive name
-
-    // Accumulators for RMS fallback
-    let mut rms_sum_of_squares: f64 = 0.0;
-    let mut rms_total_samples: u64 = 0;
-
-    loop {
-        match format.next_packet() {
-            Ok(packet) => {
-                packet_count += 1;
-                match decoder.decode(&packet) {
-                    Ok(decoded) => {
-                        decoded_frames_count += decoded.frames() as u64; // Accumulate total frames
-
-                        // --- Feed EBU R128 ---
-                        // Convert buffer to planar f32 (handle potential errors)
-                        match convert_buffer_to_planar_f32(&decoded) {
-                            Ok(planar_f32) => {
-                                // Feed EBU state
-                                let plane_slices: Vec<&[f32]> =
-                                    planar_f32.iter().map(|v| v.as_slice()).collect();
-                                if let Err(e) = ebu_state.add_frames_planar_f32(&plane_slices) {
-                                    // Decide if this error is fatal or skippable
-                                    warn!(
-                                        "EBU R128 add_frames failed for chunk in {:?}: {}. Skipping chunk for EBU.",
-                                        path.file_name().unwrap_or_default(),
-                                        e
-                                    );
-                                    // Potentially return Err(MeasurementError::EbuR128(e)) if it's critical
-                                }
-
-                                // --- Update RMS Accumulators ---
-                                update_rms_accumulators(
-                                    &planar_f32,
-                                    &mut rms_sum_of_squares,
-                                    &mut rms_total_samples,
-                                );
-                            }
-                            Err(e) => {
-                                // Failed to convert this buffer, log and skip chunk for *both* measurements
-                                warn!(
-                                    "Buffer conversion failed for chunk in {:?}: {}. Skipping chunk.",
-                                    path.file_name().unwrap_or_default(),
-                                    e
-                                );
-                                // Optionally return the error if conversion failure is critical
-                                // return Err(e);
-                            }
-                        }
-                    }
-                    Err(SymphoniaError::DecodeError(e)) => {
-                        warn!(
-                            "Decode error in {:?}: {}. Skipping packet.",
-                            path.file_name().unwrap_or_default(),
-                            e
-                        );
-                        // Continue decoding if possible
-                    }
-                    Err(SymphoniaError::IoError(ref e))
-                        if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-                    {
-                        debug!(
-                            "Decoder reached EOF for {:?}",
-                            path.file_name().unwrap_or_default()
-                        );
-                        break; // Expected EOF during decode
-                    }
-                    Err(e) => {
-                        // Treat other decode errors as potentially fatal for this file
-                        error!(
-                            "Unhandled decoder error in {:?}: {}",
-                            path.file_name().unwrap_or_default(),
-                            e
-                        );
-                        return Err(MeasurementError::Symphonia(e));
-                    }
-                }
-            }
-            Err(SymphoniaError::IoError(ref e))
-                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-            {
-                debug!(
-                    "Format reader reached EOF for {:?}",
-                    path.file_name().unwrap_or_default()
-                );
-                break; // Expected EOF at end of stream
-            }
-            Err(e) => {
-                error!(
-                    "Error reading packet from {:?}: {}",
-                    path.file_name().unwrap_or_default(),
-                    e
-                );
-                return Err(MeasurementError::Symphonia(e));
-            }
-        }
-    }
-
-    debug!(
-        "Finished decoding {:?}: {} packets, {} total frames decoded.",
-        path.file_name().unwrap_or_default(),
-        packet_count,
-        decoded_frames_count // Use the accumulated frame count
-    );
-    // Log total samples accumulated for RMS (should be frames * channels)
-    debug!(
-        "Total samples accumulated for RMS calculation in {:?}: {}",
-        path.file_name().unwrap_or_default(),
-        rms_total_samples
-    );
-
-    // --- Attempt EBU R128 Measurement ---
-    match ebu_state.loudness_global() {
-        Ok(lufs) if lufs.is_finite() => {
-            // EBU R128 succeeded and gave a valid number
-            debug!(
-                "EBU R128 measurement successful for {:?}: {:.2} LUFS",
-                path.file_name().unwrap_or_default(),
-                lufs
-            );
-            Ok(lufs)
-        }
-        Ok(lufs_non_finite) => {
-            // EBU R128 succeeded but gave Inf or NaN
-            debug!(
-                "EBU R128 measurement resulted in non-finite value ({}) for {:?}. Falling back to RMS.",
-                lufs_non_finite,
-                path.file_name().unwrap_or_default(),
-            );
-            // --- Fallback to RMS ---
-            let rms_dbfs = calculate_rms_dbfs(rms_sum_of_squares, rms_total_samples);
-            debug!(
-                // Log fallback value
-                "Fallback RMS measurement for {:?}: {:.2} dBFS",
-                path.file_name().unwrap_or_default(),
-                rms_dbfs
-            );
-            Ok(rms_dbfs)
-        }
-        Err(e) => {
-            // Other EBU R128 finalization error
-            debug!(
-                "EBU R128 finalization error for {:?}: {}. Cannot measure loudness. Attempting fallback to RMS.",
-                path.file_name().unwrap_or_default(),
-                e
-            );
-            let rms_dbfs = calculate_rms_dbfs(rms_sum_of_squares, rms_total_samples);
-            debug!(
-                // Log fallback value
-                "Fallback RMS measurement for {:?}: {:.2} dBFS",
-                path.file_name().unwrap_or_default(),
-                rms_dbfs
-            );
-            Ok(rms_dbfs)
-        }
-    }
-}
-
-/// Calculates target loudness from a set of measurements using trimmed mean
-///
-/// # Arguments
-/// * `measurements` - Map of file paths to their loudness measurements
-/// * `trim_percentage` - Percentage of measurements to trim from each end
-///
-/// # Returns
-/// Target loudness value in LUFS
-fn calculate_target_loudness(
-    measurements: &HashMap<PathBuf, Result<f64, MeasurementError>>,
-    trim_percentage: f64,
-) -> Result<f64, ProcessingError> {
-    let valid_loudnesses: Vec<f64> = measurements
-        .iter()
-        .filter_map(|(_, loudness_result)| match loudness_result {
-            // Filter out errors AND non-finite values like -inf (silence)
-            Ok(lufs) if lufs.is_finite() => Some(*lufs),
-            _ => None,
-        })
-        .collect();
-
-    if valid_loudnesses.is_empty() {
-        return Err(ProcessingError::TargetLoudnessCalculationFailed(
-            "No valid finite loudness measurements available from the sample to calculate target."
-                .to_string(),
-        ));
-    }
-
-    let mut sorted_loudnesses = valid_loudnesses;
-    sorted_loudnesses.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-    let count = sorted_loudnesses.len();
-    let trim_count_each_side = (count as f64 * trim_percentage / 2.0).floor() as usize;
-
-    debug!(
-        "Total valid samples: {count}, Trimming {trim_count_each_side} from each side"
-    );
-
-    let trimmed_slice = if count > trim_count_each_side * 2 {
-        &sorted_loudnesses[trim_count_each_side..count - trim_count_each_side]
-    } else {
-        // Not enough elements to trim, use all valid measurements
-        warn!(
-            "Not enough samples ({}) to perform {}% trimming. Using mean of all valid samples.",
-            count,
-            trim_percentage * 100.0
-        );
-        &sorted_loudnesses[..] // Use the whole slice
-    };
-
-    if trimmed_slice.is_empty() {
-        // This should theoretically not happen if valid_loudnesses was not empty,
-        // but handle defensively.
-        return Err(ProcessingError::TargetLoudnessCalculationFailed(
-            "Trimmed slice is empty, cannot calculate target loudness.".to_string(),
-        ));
-    }
-
-    let sum: f64 = trimmed_slice.iter().sum();
-    let mean = sum / trimmed_slice.len() as f64;
-
-    // Sanity check the result
-    if !mean.is_finite() {
-        return Err(ProcessingError::TargetLoudnessCalculationFailed(format!(
-            "Calculated target loudness is not a finite number ({mean:.2}). Check input sample measurements."
-        )));
-    }
-
-    Ok(mean)
-}
-
-/// Processes a single audio file: measures loudness, applies gain, and saves the result
-///
-/// # Arguments
-/// * `input_path` - Path to input audio file
-/// * `target_lufs` - Target loudness in LUFS
-/// * `target_peak_db` - Target peak level in dBTP
-/// * `input_base_dir` - Base directory for input files
-/// * `output_base_dir` - Base directory for output files. If not set, use
-/// * `cache` - Optional cache of pre-measured loudness values
+/// Main orchestration function for processing a single file using the two-pass
+/// method.
 pub fn process_single_file(
     input_path: impl AsRef<Path>,
     target_lufs: f64,
@@ -615,90 +290,70 @@ pub fn process_single_file(
     cache: &Option<HashMap<PathBuf, Result<f64, MeasurementError>>>,
 ) -> Result<(), Error> {
     let input_path = input_path.as_ref();
-    let file_format: AudioFormats =
-        AudioFormats::from_path(input_path).ok_or_else(|| Error::Processing {
-            path: input_path.to_path_buf(),
-            source: error::ProcessingError::UnsupportedFormat,
-        })?;
-    let file_name_os = input_path.file_name().unwrap_or_default();
-    let file_name_str = file_name_os.to_string_lossy();
+    let file_format = AudioFormats::from_path(input_path).ok_or_else(|| Error::Processing {
+        path: input_path.to_path_buf(),
+        source: ProcessingError::UnsupportedFormat,
+    })?;
+    let file_name_str = input_path.file_name().unwrap_or_default().to_string_lossy();
     debug!("Processing: {file_name_str}");
 
-    // 1. Measure current loudness
-    let current_lufs = match cache.as_ref().map(|x| x.get(input_path)) {
-        Some(Some(Ok(lufs_result))) => *lufs_result,
-        // because MeasurementError is not cloneable, so we cannot deal with Some(Err(e))
-        _ => measure_single_file_loudness(input_path).map_err(|e: MeasurementError| {
-            Error::Measurement {
-                path: input_path.to_path_buf(),
-                source: e,
-            }
+    // --- MEASUREMENT ---
+
+    // 1. Measure current loudness (from cache or by reading the file)
+    let current_lufs = match cache.as_ref().and_then(|x| x.get(input_path)) {
+        Some(Ok(lufs_result)) => *lufs_result,
+        _ => measure_single_file_loudness(input_path).map_err(|e| Error::Measurement {
+            path: input_path.to_path_buf(),
+            source: e,
         })?,
     };
 
-    // Handle silence or measurement errors resulting in -inf
-    if current_lufs.is_infinite() && current_lufs.is_sign_negative() {
-        info!("Skipping processing for silent file: {file_name_str}");
-        // Optionally copy the silent file or create a silent output file
-        // For now, we just skip processing it further.
+    // Handle silence or measurement errors
+    if !current_lufs.is_finite() {
+        let reason = if current_lufs.is_infinite() && current_lufs.is_sign_negative() {
+            "silent file"
+        } else {
+            "non-finite loudness"
+        };
+        info!("Skipping processing for {reason}: {file_name_str}");
         return Ok(());
     }
-    if !current_lufs.is_finite() {
-        warn!(
-            "Skipping processing for file with non-finite loudness ({current_lufs}): {file_name_str}"
-        );
-        return Ok(()); // Skip files that couldn't be measured properly (e.g., too short)
-    }
 
-    // 2. Calculate gain needed for target loudness
+    // 2. Calculate loudness gain
     let loudness_gain_db = target_lufs - current_lufs;
     let loudness_linear_gain = 10.0_f64.powf(loudness_gain_db / 20.0);
 
-    // 3. Decode file, apply gain, and find peak
-    let (processed_samples_interleaved, spec, initial_peak_db) =
-        decode_apply_gain_measure_peak(input_path, loudness_linear_gain).map_err(|e| {
-            Error::Processing {
-                path: input_path.to_path_buf(),
-                source: e,
-            }
+    // 3. Measure the true peak level *after* applying the loudness gain (without
+    // storing audio)
+    let (spec, initial_peak_db) = measure_peak_after_gain(input_path, loudness_linear_gain)
+        .map_err(|e| Error::Processing {
+            path: input_path.to_path_buf(),
+            source: e,
         })?;
 
-    // 4. Calculate gain adjustment needed for true peak limiting
+    // 4. Calculate peak limiting gain
     let peak_headroom_db = target_peak_db - initial_peak_db;
     let peak_limiting_gain_db = if peak_headroom_db < 0.0 {
-        // Peak exceeds target, need to reduce gain
         peak_headroom_db
     } else {
-        // Peak is below target, no limiting needed
         0.0
     };
     let peak_limiting_linear_gain = 10.0_f64.powf(peak_limiting_gain_db / 20.0);
 
-    // 5. Apply peak limiting gain (if necessary) and clamp (final safety)
+    // 5. Calculate the final, combined gain factor
     let final_linear_gain = loudness_linear_gain * peak_limiting_linear_gain;
-    let target_peak_linear = 10.0_f32.powf(target_peak_db as f32 / 20.0); // Target peak as linear value
-
-    let final_samples_interleaved: Vec<f32> = processed_samples_interleaved
-        .into_iter()
-        // Re-apply gain using the combined factor (more efficient than applying twice)
-        // We need the original samples again, or apply the limiting gain to the already loudness-adjusted samples.
-        // Let's apply limiting gain to the already adjusted samples.
-        .map(|s| {
-            let limited_sample = s * peak_limiting_linear_gain as f32;
-            // Clamp to the linear target peak value as a final safety measure
-            limited_sample.clamp(-target_peak_linear, target_peak_linear)
-        })
-        .collect();
 
     debug!(
         "  -> File: {file_name_str}, Current LUFS: {current_lufs:.2}, Target LUFS: {target_lufs:.2}, Loudness Gain: {loudness_gain_db:.2} dB"
     );
     debug!(
-        "  -> Initial Peak: {initial_peak_db:.2} dBFS, Target Peak: {target_peak_db:.1} dBTP, Limiting Gain: {peak_limiting_gain_db:.2} dB"
+        "  -> Initial Peak: {initial_peak_db:.2} dBTP, Target Peak: {target_peak_db:.1} dBTP, Limiting Gain: {peak_limiting_gain_db:.2} dB"
     );
     debug!("  -> Final Combined Linear Gain: {final_linear_gain:.3}x");
 
-    // 6. Determine output path
+    // --- PROCESSING & SAVING ---
+
+    // Determine output path
     let mut output_path = match output_base_dir.as_ref() {
         Some(obd) => {
             let relative_path =
@@ -711,6 +366,11 @@ pub fn process_single_file(
         None => input_path.to_path_buf(),
     };
 
+    // For non-WAV formats that will be converted, change the extension.
+    if !matches!(file_format, AudioFormats::Wav | AudioFormats::Ogg) {
+        output_path.set_extension("wav");
+    }
+
     // Ensure parent directory exists
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent).map_err(|e| Error::Io {
@@ -719,65 +379,42 @@ pub fn process_single_file(
         })?;
     }
 
-    match file_format {
-        AudioFormats::Ogg => {
-            save_as_ogg(
-                &output_path,
-                spec.channels.count(),
-                spec.rate,
-                &final_samples_interleaved,
-            )
-            .map_err(|e| Error::Writing {
-                path: output_path.clone(),
-                source: e,
-            })?;
-        }
-        // All other formats fallback to wav
-        _ => {
-            if !matches!(file_format, AudioFormats::Wav) {
-                output_path.set_extension("wav");
-            }
-            save_as_wav(
-                &output_path,
-                spec.channels.count(),
-                spec.rate,
-                &final_samples_interleaved,
-            )
-            .map_err(|e| Error::Writing {
-                path: output_path.clone(),
-                source: e,
-            })?;
-        }
-    }
+    // Decode, apply final gain, and save in a streaming manner
+    decode_apply_gain_and_save(
+        input_path,
+        &output_path,
+        &file_format,
+        spec,
+        final_linear_gain,
+    )?;
 
     debug!("Successfully wrote normalized file to {output_path:?}");
     Ok(())
 }
 
-/// Decodes an audio file, applies gain, and measures the peak level
-///
-/// # Arguments
-/// * `path` - Path to the audio file
-/// * `linear_gain` - Linear gain factor to apply
+/// Decodes an audio file, applies gain *in-memory* per chunk,
+/// and measures the resulting true peak without storing the entire file.
 ///
 /// # Returns
 ///
-/// Tuple containing:
-/// - Processed samples in interleaved format
-/// - Signal specifications
-/// - Peak level in dBFS
-fn decode_apply_gain_measure_peak(
+/// A tuple containing:
+///
+/// * `SignalSpec` - The signal specification of the decoded audio file
+/// * `f64` - The true peak of the decoded audio file
+fn measure_peak_after_gain(
     path: impl AsRef<Path>,
     linear_gain: f64,
-) -> Result<(Vec<f32>, SignalSpec, f64), ProcessingError> {
+) -> Result<(SignalSpec, f64), ProcessingError> {
     let path = path.as_ref();
     let file = fs::File::open(path)?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
-    let hint = Hint::new();
-    let meta_opts: MetadataOptions = Default::default();
-    let fmt_opts: FormatOptions = Default::default();
+    let probed = symphonia::default::get_probe().format(
+        &Hint::new(),
+        mss,
+        &Default::default(),
+        &Default::default(),
+    )?;
 
-    let probed = symphonia::default::get_probe().format(&hint, mss, &fmt_opts, &meta_opts)?;
     let mut format = probed.format;
     let track = format
         .tracks()
@@ -796,55 +433,35 @@ fn decode_apply_gain_measure_peak(
             .ok_or(ProcessingError::MissingChannelSpec)?,
     );
 
-    let dec_opts: DecoderOptions = Default::default();
-    let mut decoder = symphonia::default::get_codecs().make(&track.codec_params, &dec_opts)?;
+    let mut decoder =
+        symphonia::default::get_codecs().make(&track.codec_params, &Default::default())?;
 
-    let sample_rate = spec.rate;
     let channels_count = spec.channels.count();
-    let mut all_samples_planar: Vec<Vec<f32>> = Vec::with_capacity(channels_count);
-    for _ in 0..channels_count {
-        all_samples_planar.push(Vec::new());
-    }
-
-    // Initialize EBU R128 for true peak measurement
-    let mut ebu_state_true_peak = EbuR128::new(channels_count as u32, sample_rate, Mode::TRUE_PEAK)
+    let mut ebu_state_true_peak = EbuR128::new(channels_count as u32, spec.rate, Mode::TRUE_PEAK)
         .map_err(ProcessingError::EbuR128)?;
 
     loop {
         match format.next_packet() {
-            Ok(packet) => {
-                match decoder.decode(&packet) {
-                    Ok(decoded) => {
-                        let current_planar = convert_buffer_to_planar_f32(&decoded)?;
+            Ok(packet) => match decoder.decode(&packet) {
+                Ok(decoded) => {
+                    let current_planar = convert_buffer_to_planar_f32(&decoded)?;
 
-                        // Apply gain and collect samples for interleaving
-                        let mut gained_planar: Vec<Vec<f32>> = Vec::with_capacity(channels_count);
-                        for plane in current_planar.iter() {
-                            gained_planar
-                                .push(plane.iter().map(|&s| s * linear_gain as f32).collect());
-                        }
+                    // Apply gain to a temporary buffer for measurement
+                    let gained_planar: Vec<Vec<f32>> = current_planar
+                        .iter()
+                        .map(|plane| plane.iter().map(|&s| s * linear_gain as f32).collect())
+                        .collect();
 
-                        // Feed EBU R128 for true peak measurement
-                        let plane_slices: Vec<&[f32]> =
-                            gained_planar.iter().map(|v| v.as_slice()).collect();
-                        ebu_state_true_peak
-                            .add_frames_planar_f32(&plane_slices)
-                            .map_err(ProcessingError::EbuR128)?;
-
-                        // Append gained samples to all_samples_planar for final output
-                        for (channel_idx, plane) in gained_planar.into_iter().enumerate() {
-                            all_samples_planar[channel_idx].extend(plane);
-                        }
-                    }
-                    Err(SymphoniaError::DecodeError(e)) => warn!("Decode error: {e}"),
-                    Err(SymphoniaError::IoError(ref e))
-                        if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-                    {
-                        break;
-                    }
-                    Err(e) => return Err(ProcessingError::Symphonia(e)),
+                    // Feed EBU R128 for true peak measurement
+                    let plane_slices: Vec<&[f32]> =
+                        gained_planar.iter().map(|v| v.as_slice()).collect();
+                    ebu_state_true_peak.add_frames_planar_f32(&plane_slices)?;
                 }
-            }
+                Err(SymphoniaError::DecodeError(e)) => {
+                    warn!("Decode error during peak measurement: {e}")
+                }
+                Err(e) => return Err(ProcessingError::Symphonia(e)),
+            },
             Err(SymphoniaError::IoError(ref e))
                 if e.kind() == std::io::ErrorKind::UnexpectedEof =>
             {
@@ -854,30 +471,355 @@ fn decode_apply_gain_measure_peak(
         }
     }
 
-    // Interleave the processed samples
-    let interleaved_samples = interleave_planar_f32(&all_samples_planar);
+    // Get true peak from EBU R128 state and find the maximum across all channels
+    let max_true_peak_db = (0..channels_count)
+        .map(|i| ebu_state_true_peak.true_peak(i as u32))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .fold(f64::NEG_INFINITY, f64::max);
 
-    // Get true peak from EBU R128 state for each channel and find the maximum
-    let mut max_true_peak_db = f64::NEG_INFINITY;
-    for i in 0..channels_count {
-        let channel_true_peak = ebu_state_true_peak
-            .true_peak(i as u32)
-            .map_err(ProcessingError::EbuR128)?;
-        if channel_true_peak > max_true_peak_db {
-            max_true_peak_db = channel_true_peak;
+    Ok((spec, max_true_peak_db))
+}
+
+/// Decodes the audio file again, applies the final calculated gain, and saves
+/// the result in a streaming fashion to minimize memory usage.
+fn decode_apply_gain_and_save(
+    input_path: &Path,
+    output_path: &Path,
+    file_format: &AudioFormats,
+    spec: SignalSpec,
+    final_linear_gain: f64,
+) -> Result<(), Error> {
+    let file = fs::File::open(input_path).map_err(|e| Error::Io {
+        path: input_path.to_path_buf(),
+        source: e,
+    })?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut format = symphonia::default::get_probe()
+        .format(&Hint::new(), mss, &Default::default(), &Default::default())
+        .map_err(|e| Error::Processing {
+            path: input_path.to_path_buf(),
+            source: e.into(),
+        })?
+        .format;
+
+    let track = format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL)
+        .ok_or_else(|| Error::Processing {
+            path: input_path.to_path_buf(),
+            source: ProcessingError::NoTrack(input_path.to_path_buf()),
+        })?;
+
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &Default::default())
+        .map_err(|e| Error::Processing {
+            path: input_path.to_path_buf(),
+            source: e.into(),
+        })?;
+
+    // --- Set up the writer based on format ---
+    match file_format {
+        AudioFormats::Ogg => {
+            // OGG saving still requires collecting all samples due to vorbis-rs API.
+            // This is the main memory exception in the new architecture.
+            let samples = collect_gained_samples(&mut *format, &mut *decoder, final_linear_gain)?;
+            save_as_ogg(output_path, spec.channels.count(), spec.rate, &samples).map_err(|e| {
+                Error::Writing {
+                    path: output_path.to_path_buf(),
+                    source: e,
+                }
+            })?;
+        }
+        // All other formats are saved as WAV in a streaming fashion.
+        _ => {
+            let hound_spec = hound::WavSpec {
+                channels: spec.channels.count() as u16,
+                sample_rate: spec.rate,
+                bits_per_sample: 32,
+                sample_format: hound::SampleFormat::Float,
+            };
+            let writer =
+                hound::WavWriter::create(output_path, hound_spec).map_err(|e| Error::Writing {
+                    path: output_path.to_path_buf(),
+                    source: WritingError::Wav(e),
+                })?;
+
+            stream_to_wav_writer(&mut *format, &mut *decoder, writer, final_linear_gain)?;
         }
     }
 
-    Ok((interleaved_samples, spec, max_true_peak_db))
+    Ok(())
 }
 
-/// Converts any Symphonia audio buffer to planar f32 format
-///
-/// # Arguments
-/// * `decoded` - Reference to decoded audio buffer
-///
-/// # Returns
-/// Vector of vectors containing audio data in planar format (one vector per channel)
+/// Helper for `decode_apply_gain_and_save`: streams processed data directly to
+/// a WAV writer.
+fn stream_to_wav_writer(
+    format: &mut dyn symphonia::core::formats::FormatReader,
+    decoder: &mut dyn symphonia::core::codecs::Decoder,
+    mut writer: hound::WavWriter<std::io::BufWriter<fs::File>>,
+    final_linear_gain: f64,
+) -> Result<(), Error> {
+    loop {
+        match format.next_packet() {
+            Ok(packet) => match decoder.decode(&packet) {
+                Ok(decoded) => {
+                    let planar =
+                        convert_buffer_to_planar_f32(&decoded).map_err(|e| Error::Processing {
+                            path: PathBuf::new(), // Path context is higher up
+                            source: e,
+                        })?;
+
+                    if planar.is_empty() || planar[0].is_empty() {
+                        continue;
+                    }
+
+                    let num_frames = planar[0].len();
+                    let num_channels = planar.len();
+
+                    for frame_idx in 0..num_frames {
+                        for channel_idx in 0..num_channels {
+                            let sample = planar[channel_idx][frame_idx];
+                            let processed_sample = sample * final_linear_gain as f32;
+                            writer
+                                .write_sample(processed_sample)
+                                .map_err(|e| Error::Writing {
+                                    path: PathBuf::new(), // Path context is higher up
+                                    source: WritingError::Wav(e),
+                                })?;
+                        }
+                    }
+                }
+                Err(SymphoniaError::DecodeError(e)) => {
+                    warn!("Decode error during final write: {e}")
+                }
+                Err(e) => {
+                    return Err(Error::Processing {
+                        path: PathBuf::new(),
+                        source: e.into(),
+                    });
+                }
+            },
+            Err(SymphoniaError::IoError(ref e))
+                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break;
+            }
+            Err(e) => {
+                return Err(Error::Processing {
+                    path: PathBuf::new(),
+                    source: e.into(),
+                });
+            }
+        }
+    }
+    writer.finalize().map_err(|e| Error::Writing {
+        path: PathBuf::new(),
+        source: WritingError::Wav(e),
+    })
+}
+
+/// Helper for `decode_apply_gain_and_save`: collects all processed samples into
+/// a Vec. Used for formats that don't support streaming writes with the current
+/// libraries (e.g., Ogg).
+fn collect_gained_samples(
+    format: &mut dyn symphonia::core::formats::FormatReader,
+    decoder: &mut dyn symphonia::core::codecs::Decoder,
+    final_linear_gain: f64,
+) -> Result<Vec<f32>, Error> {
+    let mut all_samples_interleaved = Vec::new();
+    loop {
+        match format.next_packet() {
+            Ok(packet) => match decoder.decode(&packet) {
+                Ok(decoded) => {
+                    let planar =
+                        convert_buffer_to_planar_f32(&decoded).map_err(|e| Error::Processing {
+                            path: PathBuf::new(),
+                            source: e,
+                        })?;
+
+                    if planar.is_empty() || planar[0].is_empty() {
+                        continue;
+                    }
+
+                    let num_frames = planar[0].len();
+                    let num_channels = planar.len();
+
+                    for frame_idx in 0..num_frames {
+                        for channel_idx in 0..num_channels {
+                            let sample = planar[channel_idx][frame_idx];
+                            let processed_sample = sample * final_linear_gain as f32;
+                            all_samples_interleaved.push(processed_sample);
+                        }
+                    }
+                }
+                Err(SymphoniaError::DecodeError(e)) => {
+                    warn!("Decode error during sample collection: {e}")
+                }
+                Err(e) => {
+                    return Err(Error::Processing {
+                        path: PathBuf::new(),
+                        source: e.into(),
+                    });
+                }
+            },
+            Err(SymphoniaError::IoError(ref e))
+                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break;
+            }
+            Err(e) => {
+                return Err(Error::Processing {
+                    path: PathBuf::new(),
+                    source: e.into(),
+                });
+            }
+        }
+    }
+    Ok(all_samples_interleaved)
+}
+
+/// Measures the loudness of a single audio file using EBU R128 or RMS fallback
+pub fn measure_single_file_loudness(path: impl AsRef<Path>) -> Result<f64, MeasurementError> {
+    let path = path.as_ref();
+    let file = fs::File::open(path).map_err(MeasurementError::Io)?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let probed = symphonia::default::get_probe()
+        .format(&Hint::new(), mss, &Default::default(), &Default::default())
+        .map_err(MeasurementError::Symphonia)?;
+
+    let mut format = probed.format;
+    let track = format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL)
+        .ok_or(MeasurementError::NoTrack)?;
+
+    let sample_rate = track
+        .codec_params
+        .sample_rate
+        .ok_or(MeasurementError::UnsupportedFormat)?;
+    let channels = track
+        .codec_params
+        .channels
+        .ok_or(MeasurementError::UnsupportedFormat)?;
+    let channel_count = channels.count();
+
+    let mut ebu_state = EbuR128::new(channel_count as u32, sample_rate, Mode::I)
+        .map_err(MeasurementError::EbuR128)?;
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &Default::default())
+        .map_err(MeasurementError::Symphonia)?;
+
+    let mut rms_sum_of_squares: f64 = 0.0;
+    let mut rms_total_samples: u64 = 0;
+
+    loop {
+        match format.next_packet() {
+            Ok(packet) => match decoder.decode(&packet) {
+                Ok(decoded) => match convert_buffer_to_planar_f32(&decoded) {
+                    Ok(planar_f32) => {
+                        let plane_slices: Vec<&[f32]> =
+                            planar_f32.iter().map(|v| v.as_slice()).collect();
+                        if let Err(e) = ebu_state.add_frames_planar_f32(&plane_slices) {
+                            warn!("EBU R128 add_frames failed: {e}. Skipping chunk.");
+                        }
+                        update_rms_accumulators(
+                            &planar_f32,
+                            &mut rms_sum_of_squares,
+                            &mut rms_total_samples,
+                        );
+                    }
+                    Err(e) => warn!("Buffer conversion failed: {e}. Skipping chunk."),
+                },
+                Err(SymphoniaError::DecodeError(e)) => warn!("Decode error: {e}. Skipping packet."),
+                Err(e) => return Err(MeasurementError::Symphonia(e)),
+            },
+            Err(SymphoniaError::IoError(ref e))
+                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break;
+            }
+            Err(e) => return Err(MeasurementError::Symphonia(e)),
+        }
+    }
+
+    match ebu_state.loudness_global() {
+        Ok(lufs) if lufs.is_finite() => Ok(lufs),
+        _ => {
+            debug!("EBU R128 failed or gave non-finite value. Falling back to RMS.");
+            Ok(calculate_rms_dbfs(rms_sum_of_squares, rms_total_samples))
+        }
+    }
+}
+
+fn update_rms_accumulators(
+    planar_f32: &[Vec<f32>],
+    sum_of_squares: &mut f64,
+    total_samples: &mut u64,
+) {
+    for channel_buffer in planar_f32 {
+        for sample in channel_buffer {
+            *sum_of_squares += (*sample as f64) * (*sample as f64);
+        }
+    }
+    if let Some(first_channel_buffer) = planar_f32.first() {
+        *total_samples += first_channel_buffer.len() as u64;
+    }
+}
+
+fn calculate_rms_dbfs(sum_of_squares: f64, total_samples: u64) -> f64 {
+    if total_samples == 0 || sum_of_squares <= 0.0 {
+        return f64::NEG_INFINITY;
+    }
+    let mean_square = sum_of_squares / total_samples as f64;
+    20.0 * mean_square.sqrt().log10()
+}
+
+fn calculate_target_loudness(
+    measurements: &HashMap<PathBuf, Result<f64, MeasurementError>>,
+    trim_percentage: f64,
+) -> Result<f64, ProcessingError> {
+    let mut valid_loudnesses: Vec<f64> = measurements
+        .values()
+        .filter_map(|r| r.as_ref().ok().filter(|l| l.is_finite()))
+        .copied()
+        .collect();
+
+    if valid_loudnesses.is_empty() {
+        return Err(ProcessingError::TargetLoudnessCalculationFailed(
+            "No valid finite loudness measurements available.".to_string(),
+        ));
+    }
+
+    valid_loudnesses.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let count = valid_loudnesses.len();
+    let trim_count = (count as f64 * trim_percentage).floor() as usize;
+
+    let trimmed_slice = if count > trim_count * 2 {
+        &valid_loudnesses[trim_count..count - trim_count]
+    } else {
+        warn!("Not enough samples to perform trimming. Using mean of all valid samples.");
+        &valid_loudnesses[..]
+    };
+
+    if trimmed_slice.is_empty() {
+        return Err(ProcessingError::TargetLoudnessCalculationFailed(
+            "Trimmed slice is empty.".to_string(),
+        ));
+    }
+
+    let trimmed_slice_len = trimmed_slice.len();
+    let mean: f64 = trimmed_slice.iter().sum::<f64>() / trimmed_slice_len as f64;
+    if !mean.is_finite() {
+        return Err(ProcessingError::TargetLoudnessCalculationFailed(format!(
+            "Calculated target loudness is not a finite number ({mean:.2})."
+        )));
+    }
+    Ok(mean)
+}
+
 fn convert_buffer_to_planar_f32(
     decoded: &AudioBufferRef<'_>,
 ) -> Result<Vec<Vec<f32>>, ProcessingError> {
@@ -897,7 +839,6 @@ fn convert_buffer_to_planar_f32(
         }
         AudioBufferRef::S32(buf) => {
             for plane in buf.planes().planes() {
-                // 将有符号32位整数规范化到[-1.0, 1.0]范围
                 planar_output.push(
                     plane
                         .iter()
@@ -908,15 +849,11 @@ fn convert_buffer_to_planar_f32(
         }
         AudioBufferRef::S24(buf) => {
             for plane in buf.planes().planes() {
-                // i24的范围是-2^23到2^23-1
                 let max_value = 8388607.0; // 2^23 - 1
                 planar_output.push(
                     plane
                         .iter()
-                        .map(|&s| {
-                            let sample_value = s.inner() as f32;
-                            sample_value / max_value
-                        })
+                        .map(|&s| s.inner() as f32 / max_value)
                         .collect(),
                 );
             }
@@ -947,43 +884,6 @@ fn convert_buffer_to_planar_f32(
         _ => return Err(ProcessingError::UnsupportedFormat),
     }
     Ok(planar_output)
-}
-
-/// Interleaves planar audio samples into a single vector
-///
-/// # Arguments
-/// * `planar_samples` - Audio data in planar format
-///
-/// # Returns
-/// Vector containing interleaved audio samples
-fn interleave_planar_f32(planar_samples: &[Vec<f32>]) -> Vec<f32> {
-    if planar_samples.is_empty() {
-        return Vec::new();
-    }
-    let num_channels = planar_samples.len();
-    let num_frames = planar_samples[0].len(); // Assume all planes have the same length
-
-    // Validate that all planes have the same length
-    if planar_samples.iter().any(|p| p.len() != num_frames) {
-        // This indicates a problem, maybe log a warning or return error
-        // For simplicity, we'll proceed assuming they are correct, but this check is good
-        warn!("Planar sample planes have different lengths during interleaving!");
-    }
-
-    let mut interleaved = Vec::with_capacity(num_frames * num_channels);
-
-    for frame_idx in 0..num_frames {
-        for plane in planar_samples {
-            // Use get() for safety in case of inconsistent lengths
-            if let Some(sample) = plane.get(frame_idx) {
-                interleaved.push(*sample);
-            } else {
-                // Handle missing sample, e.g., push 0.0 or log error
-                interleaved.push(0.0);
-            }
-        }
-    }
-    interleaved
 }
 
 /// Validates normalization options for correctness

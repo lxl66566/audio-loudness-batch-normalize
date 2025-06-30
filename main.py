@@ -23,12 +23,12 @@ def plot_loudness_comparison(audio_path1, audio_path2):
 
     # 绘制对比图
     plt.figure(figsize=(12, 6))
-    plt.plot(times1, S1_db[0], label=f"音频1 ({Path(audio_path1).stem})", alpha=0.8)
-    plt.plot(times2, S2_db[0], label=f"音频2 ({Path(audio_path2).stem})", alpha=0.8)
+    plt.plot(times1, S1_db[0], label=f"Audio 1 ({Path(audio_path1).stem})", alpha=0.8)
+    plt.plot(times2, S2_db[0], label=f"Audio 2 ({Path(audio_path2).stem})", alpha=0.8)
 
-    plt.title("音频绝对响度对比")
-    plt.xlabel("时间 (秒)")
-    plt.ylabel("响度 (dB SPL)")
+    plt.title("Audio Absolute Loudness Comparison")
+    plt.xlabel("Time (seconds)")
+    plt.ylabel("Loudness (dB SPL)")
     plt.legend()
     plt.grid(True)
 
