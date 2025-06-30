@@ -65,13 +65,13 @@ fn main() -> Result<()> {
     );
     info!("  Trim Percentage: {}%", options.trim_percentage * 100.0);
     if let Some(t) = options.target_lufs {
-        info!("  Target Loudness: {:.2} LUFS", t);
+        info!("  Target Loudness: {t:.2} LUFS");
     } else {
         info!("  Target Loudness: Automatic (calculated)");
     }
     info!("  Target True Peak: {:.1} dBTP", options.true_peak_db);
     if let Some(n) = options.num_threads {
-        info!("  Threads: {}", n);
+        info!("  Threads: {n}");
     } else {
         info!("  Threads: Default");
     }
@@ -83,7 +83,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Err(e) => {
-            error!("Normalization failed: {}", e);
+            error!("Normalization failed: {e}");
             Err(e)?
         }
     }

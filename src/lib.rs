@@ -119,11 +119,10 @@ pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<(), E
                 .build_global();
             if let Err(e) = rayon_init_result {
                 warn!(
-                    "Failed to configure Rayon thread pool: {}. Using default number of threads.",
-                    e
+                    "Failed to configure Rayon thread pool: {e}. Using default number of threads."
                 );
             } else {
-                info!("Using {} threads for processing.", num_threads);
+                info!("Using {num_threads} threads for processing.");
             }
         } else {
             info!("Using default number of threads.");
@@ -149,7 +148,7 @@ pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<(), E
     // --- Target Loudness Calculation ---
     let target_lufs = match options.target_lufs {
         Some(t) => {
-            info!("Using user-provided Target Loudness: {:.2} LUFS", t);
+            info!("Using user-provided Target Loudness: {t:.2} LUFS");
             t
         }
         None => {
@@ -254,15 +253,14 @@ pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<(), E
         match result {
             Ok(_) => success_count += 1,
             Err(e) => {
-                error!("Error: {}", e); // Log the detailed error
+                error!("Error: {e}"); // Log the detailed error
                 error_count += 1;
             }
         }
     }
 
     info!(
-        "Processing complete. {} files succeeded, {} files failed.",
-        success_count, error_count
+        "Processing complete. {success_count} files succeeded, {error_count} files failed."
     );
 
     if error_count > 0 {
@@ -563,8 +561,7 @@ fn calculate_target_loudness(
     let trim_count_each_side = (count as f64 * trim_percentage / 2.0).floor() as usize;
 
     debug!(
-        "Total valid samples: {}, Trimming {} from each side",
-        count, trim_count_each_side
+        "Total valid samples: {count}, Trimming {trim_count_each_side} from each side"
     );
 
     let trimmed_slice = if count > trim_count_each_side * 2 {
@@ -593,8 +590,7 @@ fn calculate_target_loudness(
     // Sanity check the result
     if !mean.is_finite() {
         return Err(ProcessingError::TargetLoudnessCalculationFailed(format!(
-            "Calculated target loudness is not a finite number ({:.2}). Check input sample measurements.",
-            mean
+            "Calculated target loudness is not a finite number ({mean:.2}). Check input sample measurements."
         )));
     }
 
@@ -626,7 +622,7 @@ pub fn process_single_file(
         })?;
     let file_name_os = input_path.file_name().unwrap_or_default();
     let file_name_str = file_name_os.to_string_lossy();
-    debug!("Processing: {}", file_name_str);
+    debug!("Processing: {file_name_str}");
 
     // 1. Measure current loudness
     let current_lufs = match cache.as_ref().map(|x| x.get(input_path)) {
@@ -642,15 +638,14 @@ pub fn process_single_file(
 
     // Handle silence or measurement errors resulting in -inf
     if current_lufs.is_infinite() && current_lufs.is_sign_negative() {
-        info!("Skipping processing for silent file: {}", file_name_str);
+        info!("Skipping processing for silent file: {file_name_str}");
         // Optionally copy the silent file or create a silent output file
         // For now, we just skip processing it further.
         return Ok(());
     }
     if !current_lufs.is_finite() {
         warn!(
-            "Skipping processing for file with non-finite loudness ({}): {}",
-            current_lufs, file_name_str
+            "Skipping processing for file with non-finite loudness ({current_lufs}): {file_name_str}"
         );
         return Ok(()); // Skip files that couldn't be measured properly (e.g., too short)
     }
@@ -696,14 +691,12 @@ pub fn process_single_file(
         .collect();
 
     debug!(
-        "  -> File: {}, Current LUFS: {:.2}, Target LUFS: {:.2}, Loudness Gain: {:.2} dB",
-        file_name_str, current_lufs, target_lufs, loudness_gain_db
+        "  -> File: {file_name_str}, Current LUFS: {current_lufs:.2}, Target LUFS: {target_lufs:.2}, Loudness Gain: {loudness_gain_db:.2} dB"
     );
     debug!(
-        "  -> Initial Peak: {:.2} dBFS, Target Peak: {:.1} dBTP, Limiting Gain: {:.2} dB",
-        initial_peak_db, target_peak_db, peak_limiting_gain_db
+        "  -> Initial Peak: {initial_peak_db:.2} dBFS, Target Peak: {target_peak_db:.1} dBTP, Limiting Gain: {peak_limiting_gain_db:.2} dB"
     );
-    debug!("  -> Final Combined Linear Gain: {:.3}x", final_linear_gain);
+    debug!("  -> Final Combined Linear Gain: {final_linear_gain:.3}x");
 
     // 6. Determine output path
     let mut output_path = match output_base_dir.as_ref() {
@@ -711,8 +704,7 @@ pub fn process_single_file(
             let relative_path =
                 pathdiff::diff_paths(input_path, input_base_dir).ok_or_else(|| Error::Io {
                     path: input_path.to_path_buf(),
-                    source: std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    source: std::io::Error::other(
                         "Failed to calculate relative path",
                     ),
                 })?;
@@ -760,7 +752,7 @@ pub fn process_single_file(
         }
     }
 
-    debug!("Successfully wrote normalized file to {:?}", output_path);
+    debug!("Successfully wrote normalized file to {output_path:?}");
     Ok(())
 }
 
@@ -835,7 +827,7 @@ fn decode_apply_gain_measure_peak(
                             }
                         }
                     }
-                    Err(SymphoniaError::DecodeError(e)) => warn!("Decode error: {}", e),
+                    Err(SymphoniaError::DecodeError(e)) => warn!("Decode error: {e}"),
                     Err(SymphoniaError::IoError(ref e))
                         if e.kind() == std::io::ErrorKind::UnexpectedEof =>
                     {
@@ -998,11 +990,10 @@ fn validate_options(options: &NormalizationOptions) -> Result<(), Error> {
                 path: output_dir.to_path_buf(),
                 source: e,
             })?;
-            info!("Created output directory: {:?}", output_dir);
+            info!("Created output directory: {output_dir:?}");
         } else if !output_dir.is_dir() {
             return Err(Error::InvalidOptions(format!(
-                "Output path exists but is not a directory: {:?}",
-                output_dir
+                "Output path exists but is not a directory: {output_dir:?}"
             )));
         }
     }
