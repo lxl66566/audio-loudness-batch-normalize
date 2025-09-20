@@ -1,8 +1,4 @@
-use std::{
-    fs::File,
-    num::NonZero,
-    path::Path,
-};
+use std::{fs::File, num::NonZero, path::Path};
 
 use log::warn;
 use symphonia::core::{audio::SignalSpec, errors::Error as SymphoniaError};
@@ -13,8 +9,7 @@ use crate::{
     error::{Error, WritingError},
 };
 
-/// Helper for `decode_apply_gain_and_save`: streams processed data directly to
-/// a WAV writer.
+/// Helper for `decode_apply_gain_and_save`: collects all processed samples and saves them to a WAV file.
 pub fn stream_to_wav_writer(
     format: &mut dyn symphonia::core::formats::FormatReader,
     decoder: &mut dyn symphonia::core::codecs::Decoder,
@@ -22,74 +17,39 @@ pub fn stream_to_wav_writer(
     output_path: &Path,
     spec: SignalSpec,
 ) -> Result<(), Error> {
+    // First, collect all the processed samples into a buffer.
+    let samples = collect_gained_samples(format, decoder, final_linear_gain, output_path)?;
+
+    // Define the specification for the output WAV file.
     let hound_spec = hound::WavSpec {
         channels: spec.channels.count() as u16,
         sample_rate: spec.rate,
         bits_per_sample: 32,
         sample_format: hound::SampleFormat::Float,
     };
-    let mut writer =
-        hound::WavWriter::create(output_path, hound_spec).map_err(|e| Error::Writing {
-            path: output_path.to_path_buf(),
-            source: WritingError::Wav(e),
-        })?;
-    loop {
-        match format.next_packet() {
-            Ok(packet) => match decoder.decode(&packet) {
-                Ok(decoded) => {
-                    let planar =
-                        convert_buffer_to_planar_f32(&decoded).map_err(|e| Error::Processing {
-                            path: output_path.to_path_buf(),
-                            source: e,
-                        })?;
 
-                    if planar.is_empty() || planar[0].is_empty() {
-                        continue;
-                    }
-
-                    let num_frames = planar[0].len();
-                    let num_channels = planar.len();
-
-                    for frame_idx in 0..num_frames {
-                        for channel_idx in 0..num_channels {
-                            let sample = planar[channel_idx][frame_idx];
-                            let processed_sample = sample * final_linear_gain as f32;
-                            writer
-                                .write_sample(processed_sample)
-                                .map_err(|e| Error::Writing {
-                                    path: output_path.to_path_buf(),
-                                    source: WritingError::Wav(e),
-                                })?;
-                        }
-                    }
-                }
-                Err(SymphoniaError::DecodeError(e)) => {
-                    warn!("Decode error during final write: {e}")
-                }
-                Err(e) => {
-                    return Err(Error::Processing {
-                        path: output_path.to_path_buf(),
-                        source: e.into(),
-                    });
-                }
-            },
-            Err(SymphoniaError::IoError(ref e))
-                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-            {
-                break;
-            }
-            Err(e) => {
-                return Err(Error::Processing {
-                    path: output_path.to_path_buf(),
-                    source: e.into(),
-                });
-            }
-        }
-    }
-    writer.finalize().map_err(|e| Error::Writing {
+    // Write the collected samples to the WAV file in one go.
+    save_as_wav(output_path, hound_spec, &samples).map_err(|e| Error::Writing {
         path: output_path.to_path_buf(),
-        source: WritingError::Wav(e),
+        source: e,
     })
+}
+
+/// Saves audio data as a WAV file.
+///
+/// # Arguments
+/// * `path` - Output file path
+/// * `spec` - The WAV specification (channels, sample rate, etc.)
+/// * `samples` - Interleaved audio samples in 32-bit float format
+///
+/// # Returns
+/// Result indicating success or a WritingError
+pub fn save_as_wav(path: &Path, spec: hound::WavSpec, samples: &[f32]) -> Result<(), WritingError> {
+    let mut writer = hound::WavWriter::create(path, spec).map_err(WritingError::Wav)?;
+    for &sample in samples {
+        writer.write_sample(sample).map_err(WritingError::Wav)?;
+    }
+    writer.finalize().map_err(WritingError::Wav)
 }
 
 pub fn stream_to_ogg_writer(
