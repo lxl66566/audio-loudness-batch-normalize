@@ -19,7 +19,7 @@ indicatif         = { version = "0.18", features = ["rayon"] }
 log               = "0.4"
 pathdiff          = "0.2"
 pretty_env_logger = "0.5"
-rand              = "0.9"
+rand              = "0.10"
 rayon             = "1.8"
 strum_macros      = "0.28"
 symphonia         = { version = "0.5", features = ["all-codecs", "all-formats"] }
