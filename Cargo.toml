@@ -3,6 +3,7 @@ authors     = ["lxl66566 <lxl66566@gmail.com>"]
 categories  = ["multimedia::audio"]
 description = "Easy to use audio loudness batch normalization tool using EBU R128 and RMS"
 edition     = "2024"
+exclude     = ["pyproject.toml", "main.py", ".vscode", ".github", ".taplo.toml"]
 keywords    = ["audio", "loudness", "normalization", "batch-processing", "multimedia"]
 license     = "MIT"
 name        = "audio-loudness-batch-normalize"
