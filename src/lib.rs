@@ -176,9 +176,7 @@ pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<(), E
                 all_audio_files.iter().collect()
             } else {
                 let mut rng = rand::rng();
-                all_audio_files
-                    .choose_multiple(&mut rng, sample_size)
-                    .collect()
+                all_audio_files.sample(&mut rng, sample_size).collect()
             };
             info!(
                 "Selected {} files for target loudness calculation.",
