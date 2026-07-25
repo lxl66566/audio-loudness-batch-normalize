@@ -628,9 +628,7 @@ fn update_rms_accumulators(
         for sample in channel_buffer {
             *sum_of_squares += (*sample as f64) * (*sample as f64);
         }
-    }
-    if let Some(first_channel_buffer) = planar_f32.first() {
-        *total_samples += first_channel_buffer.len() as u64;
+        *total_samples += channel_buffer.len() as u64;
     }
 }
 
