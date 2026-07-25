@@ -768,6 +768,12 @@ fn validate_options(options: &NormalizationOptions) -> Result<(), Error> {
         }
     }
 
+    if !(0.0..=1.0).contains(&options.sample_percentage) {
+        return Err(Error::InvalidOptions(format!(
+            "Sample percentage must be in the range (0.0, 1.0]: {}",
+            options.sample_percentage
+        )));
+    }
     if !(0.0..0.5).contains(&options.trim_percentage) {
         return Err(Error::InvalidOptions(format!(
             "Trim percentage must be between 0.0 and 0.5 (exclusive of 0.5): {}",
