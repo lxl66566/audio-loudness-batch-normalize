@@ -38,6 +38,7 @@ loudness-normalize <输入目录> [选项]
     --target-lufs <浮点数>       目标响度值（LUFS）（默认：自动计算）
     --true-peak-db <浮点数>      目标真峰值（dBTP）（默认：-1.5）
 -t, --threads <数字>             处理线程数（默认：CPU核心数）
+-n, --measure-only               仅测量并计算目标响度（LUFS），不执行响度变更
 ```
 
 ## Tip

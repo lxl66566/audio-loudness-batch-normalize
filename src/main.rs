@@ -35,6 +35,11 @@ struct Cli {
     /// number of threads to use, default to CPU core count
     #[arg(short, long)]
     threads: Option<usize>,
+
+    /// only measure and report the target loudness (LUFS) without writing
+    /// normalized files
+    #[arg(short = 'n', long, default_value_t = false)]
+    measure_only: bool,
 }
 
 fn main() -> Result<()> {
@@ -56,6 +61,7 @@ fn main() -> Result<()> {
         target_lufs: cli.target_lufs,
         true_peak_db: cli.true_peak_db,
         num_threads: cli.threads,
+        measure_only: cli.measure_only,
     };
 
     info!("Starting loudness normalization with options:");
@@ -77,6 +83,7 @@ fn main() -> Result<()> {
     } else {
         info!("  Threads: Default");
     }
+    info!("  Measure Only: {}", options.measure_only);
     info!("---");
 
     match normalize_folder_loudness(&options) {

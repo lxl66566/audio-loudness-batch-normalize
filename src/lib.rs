@@ -95,6 +95,9 @@ pub struct NormalizationOptions {
     pub true_peak_db: f64,
     /// Number of threads for parallel processing
     pub num_threads: Option<usize>,
+    /// Only measure and report the target loudness without writing normalized
+    /// files
+    pub measure_only: bool,
 }
 
 impl Default for NormalizationOptions {
@@ -107,6 +110,7 @@ impl Default for NormalizationOptions {
             target_lufs: None,
             true_peak_db: -1.5,
             num_threads: None,
+            measure_only: false,
         }
     }
 }
@@ -225,6 +229,13 @@ pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<(), E
             calculated_target
         }
     };
+
+    if options.measure_only {
+        info!(
+            "Measure-only mode: target loudness is {target_lufs:.2} LUFS. Skipping normalization."
+        );
+        return Ok(());
+    }
 
     // --- Processing All Files ---
     info!(

@@ -38,6 +38,7 @@ Options:
     --target-lufs <float>             Target loudness value (LUFS) (default: auto-calculated)
     --true-peak-db <float>            Target true peak (dBTP) (default: -1.5)
 -t, --threads <number>                Number of processing threads (default: CPU core count)
+-n, --measure-only                    Only measure and report the target loudness (LUFS) without writing files
 ```
 
 ## Tip
