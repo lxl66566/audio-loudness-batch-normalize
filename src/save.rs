@@ -9,9 +9,92 @@ use crate::{
     error::{Error, WritingError},
 };
 
-/// Helper for `decode_apply_gain_and_save`: collects all processed samples and
-/// saves them to a WAV file.
+/// Decodes packets, applies gain, and writes the result to a WAV file in a
+/// streaming fashion, without buffering the whole file in memory.
+///
+/// Must not be used when `output_path` is the file being decoded: creating
+/// the writer would truncate the input. Use [`collect_and_save_wav`] for
+/// in-place overwrites.
 pub fn stream_to_wav_writer(
+    format: &mut dyn symphonia::core::formats::FormatReader,
+    decoder: &mut dyn symphonia::core::codecs::Decoder,
+    track_id: u32,
+    final_linear_gain: f64,
+    output_path: &Path,
+    spec: SignalSpec,
+) -> Result<(), Error> {
+    let mut writer =
+        hound::WavWriter::create(output_path, wav_spec(spec)).map_err(|e| Error::Writing {
+            path: output_path.to_path_buf(),
+            source: WritingError::Wav(e),
+        })?;
+
+    loop {
+        match format.next_packet() {
+            Ok(packet) => {
+                if packet.track_id() != track_id {
+                    continue;
+                }
+                match decoder.decode(&packet) {
+                    Ok(decoded) => {
+                        let planar = convert_buffer_to_planar_f32(&decoded).map_err(|e| {
+                            Error::Processing {
+                                path: output_path.to_path_buf(),
+                                source: e,
+                            }
+                        })?;
+
+                        if planar.is_empty() || planar[0].is_empty() {
+                            continue;
+                        }
+
+                        for frame_idx in 0..planar[0].len() {
+                            for channel in &planar {
+                                writer
+                                    .write_sample(channel[frame_idx] * final_linear_gain as f32)
+                                    .map_err(|e| Error::Writing {
+                                        path: output_path.to_path_buf(),
+                                        source: WritingError::Wav(e),
+                                    })?;
+                            }
+                        }
+                    }
+                    Err(SymphoniaError::DecodeError(e)) => {
+                        warn!("Decode error during WAV writing: {e}")
+                    }
+                    Err(e) => {
+                        return Err(Error::Processing {
+                            path: output_path.to_path_buf(),
+                            source: e.into(),
+                        });
+                    }
+                }
+            }
+            Err(SymphoniaError::IoError(ref e))
+                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break;
+            }
+            Err(e) => {
+                return Err(Error::Processing {
+                    path: output_path.to_path_buf(),
+                    source: e.into(),
+                });
+            }
+        }
+    }
+
+    writer.finalize().map_err(|e| Error::Writing {
+        path: output_path.to_path_buf(),
+        source: WritingError::Wav(e),
+    })
+}
+
+/// Collects all processed samples and saves them to a WAV file.
+///
+/// Required for in-place overwrites, where the input file must be fully
+/// decoded before the output file may be created.
+pub fn collect_and_save_wav(
     format: &mut dyn symphonia::core::formats::FormatReader,
     decoder: &mut dyn symphonia::core::codecs::Decoder,
     track_id: u32,
@@ -23,19 +106,20 @@ pub fn stream_to_wav_writer(
     let samples =
         collect_gained_samples(format, decoder, track_id, final_linear_gain, output_path)?;
 
-    // Define the specification for the output WAV file.
-    let hound_spec = hound::WavSpec {
+    // Write the collected samples to the WAV file in one go.
+    save_as_wav(output_path, wav_spec(spec), &samples).map_err(|e| Error::Writing {
+        path: output_path.to_path_buf(),
+        source: e,
+    })
+}
+
+fn wav_spec(spec: SignalSpec) -> hound::WavSpec {
+    hound::WavSpec {
         channels: spec.channels.count() as u16,
         sample_rate: spec.rate,
         bits_per_sample: 32,
         sample_format: hound::SampleFormat::Float,
-    };
-
-    // Write the collected samples to the WAV file in one go.
-    save_as_wav(output_path, hound_spec, &samples).map_err(|e| Error::Writing {
-        path: output_path.to_path_buf(),
-        source: e,
-    })
+    }
 }
 
 /// Saves audio data as a WAV file.

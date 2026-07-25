@@ -27,7 +27,7 @@ use walkdir::WalkDir;
 
 use crate::{
     error::{Error, MeasurementError, ProcessingError},
-    save::{stream_to_ogg_writer, stream_to_wav_writer},
+    save::{collect_and_save_wav, stream_to_ogg_writer, stream_to_wav_writer},
 };
 
 /// Represents supported audio file formats
@@ -448,16 +448,29 @@ fn decode_apply_gain_and_save(
                 spec,
             )?;
         }
-        // All other formats are saved as WAV in a streaming fashion.
+        // All other formats are saved as WAV.
         _ => {
-            stream_to_wav_writer(
-                &mut *format,
-                &mut *decoder,
-                track_id,
-                final_linear_gain,
-                output_path,
-                spec,
-            )?;
+            if output_path == input_path {
+                // In-place overwrite: decode everything before truncating the
+                // input file.
+                collect_and_save_wav(
+                    &mut *format,
+                    &mut *decoder,
+                    track_id,
+                    final_linear_gain,
+                    output_path,
+                    spec,
+                )?;
+            } else {
+                stream_to_wav_writer(
+                    &mut *format,
+                    &mut *decoder,
+                    track_id,
+                    final_linear_gain,
+                    output_path,
+                    spec,
+                )?;
+            }
         }
     }
 
