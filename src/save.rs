@@ -102,17 +102,25 @@ pub fn save_as_ogg(
     )?
     .build()?;
 
+    // Flush the encoder roughly every second of audio to bound memory usage.
+    let block_frames = sample_rate as usize;
+
     // Convert interleaved samples to planar format
-    let mut planar_samples: Vec<Vec<f32>> = vec![Vec::new(); channels];
-    for (i, &sample) in samples.iter().enumerate() {
-        let channel = i % channels;
-        planar_samples[channel].push(sample);
-        if channel * sample_rate as usize * 2 == i + 1 {
+    let mut planar_samples: Vec<Vec<f32>> = vec![Vec::with_capacity(block_frames); channels];
+    for frame in samples.chunks_exact(channels) {
+        for (channel, &sample) in frame.iter().enumerate() {
+            planar_samples[channel].push(sample);
+        }
+        if planar_samples[0].len() >= block_frames {
             encoder.encode_audio_block(&planar_samples)?;
-            planar_samples = vec![Vec::new(); channels];
+            for channel_samples in &mut planar_samples {
+                channel_samples.clear();
+            }
         }
     }
-    encoder.encode_audio_block(&planar_samples)?;
+    if !planar_samples[0].is_empty() {
+        encoder.encode_audio_block(&planar_samples)?;
+    }
     encoder.finish()?;
     Ok(())
 }
