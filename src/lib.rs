@@ -111,6 +111,17 @@ impl Default for NormalizationOptions {
     }
 }
 
+/// Loudness statistics of a single audio file, measured in one decode pass
+#[derive(Debug, Clone, Copy)]
+pub struct AudioStats {
+    /// Integrated loudness in LUFS
+    pub loudness_lufs: f64,
+    /// True peak in dBTP
+    pub true_peak_db: f64,
+    /// Signal specification (sample rate and channel layout)
+    pub spec: SignalSpec,
+}
+
 /// Normalize the loudness of all audio files in a folder
 pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<(), Error> {
     if let Some(num_threads) = options.num_threads {
@@ -182,12 +193,12 @@ pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<(), E
                 .progress_chars("#>-"));
             sample_pb.set_message("Measuring samples");
 
-            let loudness_measurements: HashMap<PathBuf, Result<f64, MeasurementError>> =
+            let loudness_measurements: HashMap<PathBuf, Result<AudioStats, MeasurementError>> =
                 sampled_files
                     .par_iter()
                     .progress_with(sample_pb.clone())
                     .map(|path| {
-                        let loudness_result = measure_single_file_loudness(path);
+                        let loudness_result = measure_single_file_stats(path);
                         if let Err(e) = &loudness_result {
                             warn!(
                                 "Failed to measure loudness for sample {:?}: {}",
@@ -281,7 +292,7 @@ pub fn process_single_file(
     target_peak_db: f64,
     input_base_dir: impl AsRef<Path>,
     output_base_dir: &Option<impl AsRef<Path>>,
-    cache: &Option<HashMap<PathBuf, Result<f64, MeasurementError>>>,
+    cache: &Option<HashMap<PathBuf, Result<AudioStats, MeasurementError>>>,
 ) -> Result<(), Error> {
     let input_path = input_path.as_ref();
     let file_format = AudioFormats::from_path(input_path).ok_or_else(|| Error::Processing {
@@ -293,14 +304,23 @@ pub fn process_single_file(
 
     // --- MEASUREMENT ---
 
-    // 1. Measure current loudness (from cache or by reading the file)
-    let current_lufs = match cache.as_ref().and_then(|x| x.get(input_path)) {
-        Some(Ok(lufs_result)) => *lufs_result,
-        _ => measure_single_file_loudness(input_path).map_err(|e| Error::Measurement {
+    // 1. Measure loudness and true peak in a single decode pass (or reuse the
+    // cached measurement from the sampling phase)
+    let stats = match cache.as_ref().and_then(|x| x.get(input_path)) {
+        Some(Ok(stats)) => *stats,
+        Some(Err(_)) => {
+            return Err(Error::Measurement {
+                path: input_path.to_path_buf(),
+                source: MeasurementError::SamplingFailed,
+            });
+        }
+        None => measure_single_file_stats(input_path).map_err(|e| Error::Measurement {
             path: input_path.to_path_buf(),
             source: e,
         })?,
     };
+
+    let current_lufs = stats.loudness_lufs;
 
     // Handle silence or measurement errors
     if !current_lufs.is_finite() {
@@ -317,13 +337,10 @@ pub fn process_single_file(
     let loudness_gain_db = target_lufs - current_lufs;
     let loudness_linear_gain = 10.0_f64.powf(loudness_gain_db / 20.0);
 
-    // 3. Measure the true peak level *after* applying the loudness gain (without
-    // storing audio)
-    let (spec, initial_peak_db) = measure_peak_after_gain(input_path, loudness_linear_gain)
-        .map_err(|e| Error::Processing {
-            path: input_path.to_path_buf(),
-            source: e,
-        })?;
+    // 3. True peak level *after* applying the loudness gain: the measurement is
+    // linear, so a constant gain shifts the peak by the same dB amount
+    let spec = stats.spec;
+    let initial_peak_db = stats.true_peak_db + loudness_gain_db;
 
     // 4. Calculate peak limiting gain
     let peak_headroom_db = target_peak_db - initial_peak_db;
@@ -380,100 +397,6 @@ pub fn process_single_file(
 
     debug!("Successfully wrote normalized file to {output_path:?}");
     Ok(())
-}
-
-/// Decodes an audio file, applies gain *in-memory* per chunk,
-/// and measures the resulting true peak without storing the entire file.
-///
-/// # Returns
-///
-/// A tuple containing:
-///
-/// * `SignalSpec` - The signal specification of the decoded audio file
-/// * `f64` - The true peak of the decoded audio file
-fn measure_peak_after_gain(
-    path: impl AsRef<Path>,
-    linear_gain: f64,
-) -> Result<(SignalSpec, f64), ProcessingError> {
-    let path = path.as_ref();
-    let file = fs::File::open(path)?;
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
-    let probed = symphonia::default::get_probe().format(
-        &Hint::new(),
-        mss,
-        &Default::default(),
-        &Default::default(),
-    )?;
-
-    let mut format = probed.format;
-    let track = format
-        .tracks()
-        .iter()
-        .find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL)
-        .ok_or_else(|| ProcessingError::NoTrack(path.to_path_buf()))?;
-
-    let spec = SignalSpec::new(
-        track
-            .codec_params
-            .sample_rate
-            .ok_or(ProcessingError::MissingSampleRate)?,
-        track
-            .codec_params
-            .channels
-            .ok_or(ProcessingError::MissingChannelSpec)?,
-    );
-
-    let track_id = track.id;
-    let mut decoder =
-        symphonia::default::get_codecs().make(&track.codec_params, &Default::default())?;
-
-    let channels_count = spec.channels.count();
-    let mut ebu_state_true_peak = EbuR128::new(channels_count as u32, spec.rate, Mode::TRUE_PEAK)
-        .map_err(ProcessingError::EbuR128)?;
-
-    loop {
-        match format.next_packet() {
-            Ok(packet) => {
-                if packet.track_id() != track_id {
-                    continue;
-                }
-                match decoder.decode(&packet) {
-                    Ok(decoded) => {
-                        let current_planar = convert_buffer_to_planar_f32(&decoded)?;
-
-                        // Feed EBU R128 for true peak measurement. The linear gain
-                        // is applied arithmetically to the result: true peak
-                        // measurement is linear, so a constant gain simply shifts
-                        // the peak by the same dB amount.
-                        let plane_slices: Vec<&[f32]> =
-                            current_planar.iter().map(|v| v.as_slice()).collect();
-                        ebu_state_true_peak.add_frames_planar_f32(&plane_slices)?;
-                    }
-                    Err(SymphoniaError::DecodeError(e)) => {
-                        warn!("Decode error during peak measurement: {e}")
-                    }
-                    Err(e) => return Err(ProcessingError::Symphonia(e)),
-                }
-            }
-            Err(SymphoniaError::IoError(ref e))
-                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-            {
-                break;
-            }
-            Err(e) => return Err(ProcessingError::Symphonia(e)),
-        }
-    }
-
-    // Get true peak from EBU R128 state and find the maximum across all channels
-    let max_true_peak_db = (0..channels_count)
-        .map(|i| ebu_state_true_peak.true_peak(i as u32))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .fold(f64::NEG_INFINITY, f64::max);
-
-    // A constant linear gain scales the true peak by the same factor
-    let gain_db = 20.0 * linear_gain.log10();
-    Ok((spec, max_true_peak_db + gain_db))
 }
 
 /// Decodes the audio file again, applies the final calculated gain, and saves
@@ -543,8 +466,9 @@ fn decode_apply_gain_and_save(
     Ok(())
 }
 
-/// Measures the loudness of a single audio file using EBU R128 or RMS fallback
-pub fn measure_single_file_loudness(path: impl AsRef<Path>) -> Result<f64, MeasurementError> {
+/// Measures the loudness and true peak of a single audio file in one decode
+/// pass, using EBU R128 with an RMS fallback for the loudness
+pub fn measure_single_file_stats(path: impl AsRef<Path>) -> Result<AudioStats, MeasurementError> {
     let path = path.as_ref();
     let file = fs::File::open(path).map_err(MeasurementError::Io)?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
@@ -570,7 +494,7 @@ pub fn measure_single_file_loudness(path: impl AsRef<Path>) -> Result<f64, Measu
     let channel_count = channels.count();
     let track_id = track.id;
 
-    let mut ebu_state = EbuR128::new(channel_count as u32, sample_rate, Mode::I)
+    let mut ebu_state = EbuR128::new(channel_count as u32, sample_rate, Mode::I | Mode::TRUE_PEAK)
         .map_err(MeasurementError::EbuR128)?;
     let mut decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &Default::default())
@@ -616,13 +540,32 @@ pub fn measure_single_file_loudness(path: impl AsRef<Path>) -> Result<f64, Measu
         }
     }
 
-    match ebu_state.loudness_global() {
-        Ok(lufs) if lufs.is_finite() => Ok(lufs),
+    let loudness_lufs = match ebu_state.loudness_global() {
+        Ok(lufs) if lufs.is_finite() => lufs,
         _ => {
             debug!("EBU R128 failed or gave non-finite value. Falling back to RMS.");
-            Ok(calculate_rms_dbfs(rms_sum_of_squares, rms_total_samples))
+            calculate_rms_dbfs(rms_sum_of_squares, rms_total_samples)
         }
-    }
+    };
+
+    // Maximum true peak across all channels. If the EBU R128 state is broken,
+    // fall back to negative infinity (no peak limiting will be applied).
+    let true_peak_db = (0..channel_count)
+        .map(|i| ebu_state.true_peak(i as u32))
+        .collect::<Result<Vec<_>, _>>()
+        .map(|peaks| peaks.into_iter().fold(f64::NEG_INFINITY, f64::max))
+        .unwrap_or(f64::NEG_INFINITY);
+
+    Ok(AudioStats {
+        loudness_lufs,
+        true_peak_db,
+        spec: SignalSpec::new(sample_rate, channels),
+    })
+}
+
+/// Measures the loudness of a single audio file using EBU R128 or RMS fallback
+pub fn measure_single_file_loudness(path: impl AsRef<Path>) -> Result<f64, MeasurementError> {
+    Ok(measure_single_file_stats(path)?.loudness_lufs)
 }
 
 fn update_rms_accumulators(
@@ -647,13 +590,17 @@ fn calculate_rms_dbfs(sum_of_squares: f64, total_samples: u64) -> f64 {
 }
 
 fn calculate_target_loudness(
-    measurements: &HashMap<PathBuf, Result<f64, MeasurementError>>,
+    measurements: &HashMap<PathBuf, Result<AudioStats, MeasurementError>>,
     trim_percentage: f64,
 ) -> Result<f64, ProcessingError> {
     let mut valid_loudnesses: Vec<f64> = measurements
         .values()
-        .filter_map(|r| r.as_ref().ok().filter(|l| l.is_finite()))
-        .copied()
+        .filter_map(|r| {
+            r.as_ref()
+                .ok()
+                .map(|stats| stats.loudness_lufs)
+                .filter(|l| l.is_finite())
+        })
         .collect();
 
     if valid_loudnesses.is_empty() {

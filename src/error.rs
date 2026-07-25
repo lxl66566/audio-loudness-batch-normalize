@@ -14,6 +14,8 @@ pub enum MeasurementError {
     NoTrack,
     #[error("Unsupported sample format")]
     UnsupportedFormat,
+    #[error("measurement already failed during the sampling phase")]
+    SamplingFailed,
 }
 
 #[derive(thiserror::Error, Debug)]
