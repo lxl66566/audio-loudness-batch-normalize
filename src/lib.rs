@@ -441,15 +441,12 @@ fn measure_peak_after_gain(
                     Ok(decoded) => {
                         let current_planar = convert_buffer_to_planar_f32(&decoded)?;
 
-                        // Apply gain to a temporary buffer for measurement
-                        let gained_planar: Vec<Vec<f32>> = current_planar
-                            .iter()
-                            .map(|plane| plane.iter().map(|&s| s * linear_gain as f32).collect())
-                            .collect();
-
-                        // Feed EBU R128 for true peak measurement
+                        // Feed EBU R128 for true peak measurement. The linear gain
+                        // is applied arithmetically to the result: true peak
+                        // measurement is linear, so a constant gain simply shifts
+                        // the peak by the same dB amount.
                         let plane_slices: Vec<&[f32]> =
-                            gained_planar.iter().map(|v| v.as_slice()).collect();
+                            current_planar.iter().map(|v| v.as_slice()).collect();
                         ebu_state_true_peak.add_frames_planar_f32(&plane_slices)?;
                     }
                     Err(SymphoniaError::DecodeError(e)) => {
@@ -474,7 +471,9 @@ fn measure_peak_after_gain(
         .into_iter()
         .fold(f64::NEG_INFINITY, f64::max);
 
-    Ok((spec, max_true_peak_db))
+    // A constant linear gain scales the true peak by the same factor
+    let gain_db = 20.0 * linear_gain.log10();
+    Ok((spec, max_true_peak_db + gain_db))
 }
 
 /// Decodes the audio file again, applies the final calculated gain, and saves
