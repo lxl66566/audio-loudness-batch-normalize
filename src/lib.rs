@@ -111,12 +111,6 @@ impl Default for NormalizationOptions {
     }
 }
 
-/// Represents an audio file to be processed
-#[derive(Debug)]
-struct AudioFile {
-    path: PathBuf,
-}
-
 /// Normalize the loudness of all audio files in a folder
 pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<(), Error> {
     if let Some(num_threads) = options.num_threads {
@@ -167,7 +161,7 @@ pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<(), E
                     "Sample size is 0, please check your sample percentage.".to_string(),
                 ));
             }
-            let sampled_files: Vec<&AudioFile> = if sample_size >= all_audio_files.len() {
+            let sampled_files: Vec<&PathBuf> = if sample_size >= all_audio_files.len() {
                 all_audio_files.iter().collect()
             } else {
                 let mut rng = rand::rng();
@@ -192,16 +186,16 @@ pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<(), E
                 sampled_files
                     .par_iter()
                     .progress_with(sample_pb.clone())
-                    .map(|audio_file| {
-                        let loudness_result = measure_single_file_loudness(&audio_file.path);
+                    .map(|path| {
+                        let loudness_result = measure_single_file_loudness(path);
                         if let Err(e) = &loudness_result {
                             warn!(
                                 "Failed to measure loudness for sample {:?}: {}",
-                                audio_file.path.file_name().unwrap_or_default(),
+                                path.file_name().unwrap_or_default(),
                                 e
                             );
                         }
-                        (audio_file.path.clone(), loudness_result)
+                        ((*path).clone(), loudness_result)
                     })
                     .collect();
             sample_pb.finish_with_message("Sample measurement done");
@@ -241,9 +235,9 @@ pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<(), E
     let results: Vec<Result<(), Error>> = all_audio_files
         .par_iter()
         .progress_with(process_pb.clone())
-        .map(|audio_file| {
+        .map(|path| {
             process_single_file(
-                &audio_file.path,
+                path,
                 target_lufs,
                 options.true_peak_db,
                 &options.input_dir,
@@ -795,8 +789,8 @@ fn validate_options(options: &NormalizationOptions) -> Result<(), Error> {
 /// * `input_dir` - Directory to search for audio files
 ///
 /// # Returns
-/// Vector of AudioFile structs representing found audio files
-fn find_audio_files(input_dir: impl AsRef<Path>) -> Result<Vec<AudioFile>, Error> {
+/// Vector of paths to the found audio files
+fn find_audio_files(input_dir: impl AsRef<Path>) -> Result<Vec<PathBuf>, Error> {
     let mut audio_files = Vec::new();
     // Define supported extensions (lowercase)
 
@@ -812,9 +806,7 @@ fn find_audio_files(input_dir: impl AsRef<Path>) -> Result<Vec<AudioFile>, Error
             .map(|s| s.to_lowercase())
             && AudioFormats::supported_extensions().contains(&ext.as_str())
         {
-            audio_files.push(AudioFile {
-                path: path.to_path_buf(),
-            });
+            audio_files.push(path.to_path_buf());
         }
     }
     Ok(audio_files)
