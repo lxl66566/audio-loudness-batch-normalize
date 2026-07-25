@@ -559,12 +559,20 @@ pub fn measure_single_file_stats(path: impl AsRef<Path>) -> Result<AudioStats, M
         }
     };
 
-    // Maximum true peak across all channels. If the EBU R128 state is broken,
+    // Maximum true peak across all channels. `EbuR128::true_peak` returns a
+    // linear amplitude; convert it to dBTP. If the EBU R128 state is broken,
     // fall back to negative infinity (no peak limiting will be applied).
     let true_peak_db = (0..channel_count)
         .map(|i| ebu_state.true_peak(i as u32))
         .collect::<Result<Vec<_>, _>>()
-        .map(|peaks| peaks.into_iter().fold(f64::NEG_INFINITY, f64::max))
+        .map(|peaks| {
+            let linear = peaks.into_iter().fold(0.0_f64, f64::max);
+            if linear > 0.0 {
+                20.0 * linear.log10()
+            } else {
+                f64::NEG_INFINITY
+            }
+        })
         .unwrap_or(f64::NEG_INFINITY);
 
     Ok(AudioStats {
