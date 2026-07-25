@@ -60,8 +60,7 @@ pub fn stream_to_ogg_writer(
     spec: SignalSpec,
 ) -> Result<(), Error> {
     // OGG saving still requires collecting all samples due to vorbis-rs API.
-    let samples =
-        collect_gained_samples(&mut *format, &mut *decoder, final_linear_gain, output_path)?;
+    let samples = collect_gained_samples(format, decoder, final_linear_gain, output_path)?;
     save_as_ogg(output_path, spec.channels.count(), spec.rate, &samples).map_err(|e| {
         Error::Writing {
             path: output_path.to_path_buf(),

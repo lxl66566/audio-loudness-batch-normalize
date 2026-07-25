@@ -327,11 +327,7 @@ pub fn process_single_file(
 
     // 4. Calculate peak limiting gain
     let peak_headroom_db = target_peak_db - initial_peak_db;
-    let peak_limiting_gain_db = if peak_headroom_db < 0.0 {
-        peak_headroom_db
-    } else {
-        0.0
-    };
+    let peak_limiting_gain_db = peak_headroom_db.min(0.0);
     let peak_limiting_linear_gain = 10.0_f64.powf(peak_limiting_gain_db / 20.0);
 
     // 5. Calculate the final, combined gain factor
@@ -650,7 +646,7 @@ fn calculate_target_loudness(
         ));
     }
 
-    valid_loudnesses.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    valid_loudnesses.sort_by(f64::total_cmp);
     let count = valid_loudnesses.len();
     let trim_count = (count as f64 * trim_percentage).floor() as usize;
 
