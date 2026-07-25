@@ -1,7 +1,7 @@
 use std::{fs::File, num::NonZero, path::Path};
 
 use log::warn;
-use symphonia::core::{audio::SignalSpec, errors::Error as SymphoniaError};
+use symphonia::core::errors::Error as SymphoniaError;
 use vorbis_rs::VorbisEncoderBuilder;
 
 use crate::{
@@ -17,22 +17,23 @@ use crate::{
 /// in-place overwrites.
 pub fn stream_to_wav_writer(
     format: &mut dyn symphonia::core::formats::FormatReader,
-    decoder: &mut dyn symphonia::core::codecs::Decoder,
+    decoder: &mut dyn symphonia::core::codecs::audio::AudioDecoder,
     track_id: u32,
     final_linear_gain: f64,
     output_path: &Path,
-    spec: SignalSpec,
+    sample_rate: u32,
+    channels: u16,
 ) -> Result<(), Error> {
-    let mut writer =
-        hound::WavWriter::create(output_path, wav_spec(spec)).map_err(|e| Error::Writing {
+    let mut writer = hound::WavWriter::create(output_path, wav_spec(sample_rate, channels))
+        .map_err(|e| Error::Writing {
             path: output_path.to_path_buf(),
             source: WritingError::Wav(e),
         })?;
 
     loop {
         match format.next_packet() {
-            Ok(packet) => {
-                if packet.track_id() != track_id {
+            Ok(Some(packet)) => {
+                if packet.track_id != track_id {
                     continue;
                 }
                 match decoder.decode(&packet) {
@@ -70,6 +71,7 @@ pub fn stream_to_wav_writer(
                     }
                 }
             }
+            Ok(None) => break,
             Err(SymphoniaError::IoError(ref e))
                 if e.kind() == std::io::ErrorKind::UnexpectedEof =>
             {
@@ -96,27 +98,30 @@ pub fn stream_to_wav_writer(
 /// decoded before the output file may be created.
 pub fn collect_and_save_wav(
     format: &mut dyn symphonia::core::formats::FormatReader,
-    decoder: &mut dyn symphonia::core::codecs::Decoder,
+    decoder: &mut dyn symphonia::core::codecs::audio::AudioDecoder,
     track_id: u32,
     final_linear_gain: f64,
     output_path: &Path,
-    spec: SignalSpec,
+    sample_rate: u32,
+    channels: u16,
 ) -> Result<(), Error> {
     // First, collect all the processed samples into a buffer.
     let samples =
         collect_gained_samples(format, decoder, track_id, final_linear_gain, output_path)?;
 
     // Write the collected samples to the WAV file in one go.
-    save_as_wav(output_path, wav_spec(spec), &samples).map_err(|e| Error::Writing {
-        path: output_path.to_path_buf(),
-        source: e,
+    save_as_wav(output_path, wav_spec(sample_rate, channels), &samples).map_err(|e| {
+        Error::Writing {
+            path: output_path.to_path_buf(),
+            source: e,
+        }
     })
 }
 
-fn wav_spec(spec: SignalSpec) -> hound::WavSpec {
+fn wav_spec(sample_rate: u32, channels: u16) -> hound::WavSpec {
     hound::WavSpec {
-        channels: spec.channels.count() as u16,
-        sample_rate: spec.rate,
+        channels,
+        sample_rate,
         bits_per_sample: 32,
         sample_format: hound::SampleFormat::Float,
     }
@@ -141,16 +146,17 @@ pub fn save_as_wav(path: &Path, spec: hound::WavSpec, samples: &[f32]) -> Result
 
 pub fn stream_to_ogg_writer(
     format: &mut dyn symphonia::core::formats::FormatReader,
-    decoder: &mut dyn symphonia::core::codecs::Decoder,
+    decoder: &mut dyn symphonia::core::codecs::audio::AudioDecoder,
     track_id: u32,
     final_linear_gain: f64,
     output_path: &Path,
-    spec: SignalSpec,
+    sample_rate: u32,
+    channels: u16,
 ) -> Result<(), Error> {
     // OGG saving still requires collecting all samples due to vorbis-rs API.
     let samples =
         collect_gained_samples(format, decoder, track_id, final_linear_gain, output_path)?;
-    save_as_ogg(output_path, spec.channels.count(), spec.rate, &samples).map_err(|e| {
+    save_as_ogg(output_path, channels as usize, sample_rate, &samples).map_err(|e| {
         Error::Writing {
             path: output_path.to_path_buf(),
             source: e,
@@ -218,7 +224,7 @@ pub fn save_as_ogg(
 /// libraries (e.g., Ogg).
 fn collect_gained_samples(
     format: &mut dyn symphonia::core::formats::FormatReader,
-    decoder: &mut dyn symphonia::core::codecs::Decoder,
+    decoder: &mut dyn symphonia::core::codecs::audio::AudioDecoder,
     track_id: u32,
     final_linear_gain: f64,
     output_path: &Path, // for error context
@@ -226,8 +232,8 @@ fn collect_gained_samples(
     let mut all_samples_interleaved = Vec::new();
     loop {
         match format.next_packet() {
-            Ok(packet) => {
-                if packet.track_id() != track_id {
+            Ok(Some(packet)) => {
+                if packet.track_id != track_id {
                     continue;
                 }
                 match decoder.decode(&packet) {
@@ -265,6 +271,7 @@ fn collect_gained_samples(
                     }
                 }
             }
+            Ok(None) => break,
             Err(SymphoniaError::IoError(ref e))
                 if e.kind() == std::io::ErrorKind::UnexpectedEof =>
             {

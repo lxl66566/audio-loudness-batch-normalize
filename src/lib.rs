@@ -18,10 +18,10 @@ use rand::seq::IndexedRandom as _;
 use rayon::prelude::*;
 use strum_macros::Display;
 use symphonia::core::{
-    audio::{AudioBufferRef, SignalSpec},
+    audio::{Audio, Channels, GenericAudioBufferRef},
     errors::Error as SymphoniaError,
+    formats::{TrackType, probe::Hint},
     io::MediaSourceStream,
-    probe::Hint,
 };
 use walkdir::WalkDir;
 
@@ -118,8 +118,6 @@ pub struct AudioStats {
     pub loudness_lufs: f64,
     /// True peak in dBTP
     pub true_peak_db: f64,
-    /// Signal specification (sample rate and channel layout)
-    pub spec: SignalSpec,
 }
 
 /// Normalize the loudness of all audio files in a folder
@@ -337,7 +335,6 @@ pub fn process_single_file(
 
     // 3. True peak level *after* applying the loudness gain: the measurement is
     // linear, so a constant gain shifts the peak by the same dB amount
-    let spec = stats.spec;
     let initial_peak_db = stats.true_peak_db + loudness_gain_db;
 
     // 4. Calculate peak limiting gain
@@ -385,13 +382,7 @@ pub fn process_single_file(
     }
 
     // Decode, apply final gain, and save in a streaming manner
-    decode_apply_gain_and_save(
-        input_path,
-        &output_path,
-        &file_format,
-        spec,
-        final_linear_gain,
-    )?;
+    decode_apply_gain_and_save(input_path, &output_path, &file_format, final_linear_gain)?;
 
     debug!("Successfully wrote normalized file to {output_path:?}");
     Ok(())
@@ -403,7 +394,6 @@ fn decode_apply_gain_and_save(
     input_path: &Path,
     output_path: &Path,
     file_format: &AudioFormats,
-    spec: SignalSpec,
     final_linear_gain: f64,
 ) -> Result<(), Error> {
     let file = fs::File::open(input_path).map_err(|e| Error::Io {
@@ -412,25 +402,42 @@ fn decode_apply_gain_and_save(
     })?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
     let mut format = symphonia::default::get_probe()
-        .format(&Hint::new(), mss, &Default::default(), &Default::default())
+        .probe(&Hint::new(), mss, Default::default(), Default::default())
         .map_err(|e| Error::Processing {
             path: input_path.to_path_buf(),
             source: e.into(),
-        })?
-        .format;
+        })?;
 
     let track = format
-        .tracks()
-        .iter()
-        .find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL)
+        .default_track(TrackType::Audio)
         .ok_or_else(|| Error::Processing {
             path: input_path.to_path_buf(),
             source: ProcessingError::NoTrack(input_path.to_path_buf()),
         })?;
 
     let track_id = track.id;
+    let audio_params = track
+        .codec_params
+        .as_ref()
+        .and_then(symphonia::core::codecs::CodecParameters::audio)
+        .ok_or_else(|| Error::Processing {
+            path: input_path.to_path_buf(),
+            source: ProcessingError::NoTrack(input_path.to_path_buf()),
+        })?;
+    let sample_rate = audio_params.sample_rate.ok_or_else(|| Error::Processing {
+        path: input_path.to_path_buf(),
+        source: ProcessingError::MissingSampleRate,
+    })?;
+    let channels = audio_params
+        .channels
+        .as_ref()
+        .map(|c| c.count() as u16)
+        .ok_or_else(|| Error::Processing {
+            path: input_path.to_path_buf(),
+            source: ProcessingError::MissingChannelSpec,
+        })?;
     let mut decoder = symphonia::default::get_codecs()
-        .make(&track.codec_params, &Default::default())
+        .make_audio_decoder(audio_params, &Default::default())
         .map_err(|e| Error::Processing {
             path: input_path.to_path_buf(),
             source: e.into(),
@@ -445,7 +452,8 @@ fn decode_apply_gain_and_save(
                 track_id,
                 final_linear_gain,
                 output_path,
-                spec,
+                sample_rate,
+                channels,
             )?;
         }
         // All other formats are saved as WAV.
@@ -459,7 +467,8 @@ fn decode_apply_gain_and_save(
                     track_id,
                     final_linear_gain,
                     output_path,
-                    spec,
+                    sample_rate,
+                    channels,
                 )?;
             } else {
                 stream_to_wav_writer(
@@ -468,7 +477,8 @@ fn decode_apply_gain_and_save(
                     track_id,
                     final_linear_gain,
                     output_path,
-                    spec,
+                    sample_rate,
+                    channels,
                 )?;
             }
         }
@@ -484,31 +494,34 @@ pub fn measure_single_file_stats(path: impl AsRef<Path>) -> Result<AudioStats, M
     let file = fs::File::open(path).map_err(MeasurementError::Io)?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
     let probed = symphonia::default::get_probe()
-        .format(&Hint::new(), mss, &Default::default(), &Default::default())
+        .probe(&Hint::new(), mss, Default::default(), Default::default())
         .map_err(MeasurementError::Symphonia)?;
 
-    let mut format = probed.format;
+    let mut format = probed;
     let track = format
-        .tracks()
-        .iter()
-        .find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL)
+        .default_track(TrackType::Audio)
         .ok_or(MeasurementError::NoTrack)?;
 
-    let sample_rate = track
+    let audio_params = track
         .codec_params
+        .as_ref()
+        .and_then(symphonia::core::codecs::CodecParameters::audio)
+        .ok_or(MeasurementError::UnsupportedFormat)?;
+
+    let sample_rate = audio_params
         .sample_rate
         .ok_or(MeasurementError::UnsupportedFormat)?;
-    let channels = track
-        .codec_params
+    let channel_count = audio_params
         .channels
+        .as_ref()
+        .map(Channels::count)
         .ok_or(MeasurementError::UnsupportedFormat)?;
-    let channel_count = channels.count();
     let track_id = track.id;
 
     let mut ebu_state = EbuR128::new(channel_count as u32, sample_rate, Mode::I | Mode::TRUE_PEAK)
         .map_err(MeasurementError::EbuR128)?;
     let mut decoder = symphonia::default::get_codecs()
-        .make(&track.codec_params, &Default::default())
+        .make_audio_decoder(audio_params, &Default::default())
         .map_err(MeasurementError::Symphonia)?;
 
     let mut rms_sum_of_squares: f64 = 0.0;
@@ -516,8 +529,8 @@ pub fn measure_single_file_stats(path: impl AsRef<Path>) -> Result<AudioStats, M
 
     loop {
         match format.next_packet() {
-            Ok(packet) => {
-                if packet.track_id() != track_id {
+            Ok(Some(packet)) => {
+                if packet.track_id != track_id {
                     continue;
                 }
                 match decoder.decode(&packet) {
@@ -542,6 +555,7 @@ pub fn measure_single_file_stats(path: impl AsRef<Path>) -> Result<AudioStats, M
                     Err(e) => return Err(MeasurementError::Symphonia(e)),
                 }
             }
+            Ok(None) => break,
             Err(SymphoniaError::IoError(ref e))
                 if e.kind() == std::io::ErrorKind::UnexpectedEof =>
             {
@@ -578,7 +592,6 @@ pub fn measure_single_file_stats(path: impl AsRef<Path>) -> Result<AudioStats, M
     Ok(AudioStats {
         loudness_lufs,
         true_peak_db,
-        spec: SignalSpec::new(sample_rate, channels),
     })
 }
 
@@ -656,24 +669,24 @@ fn calculate_target_loudness(
 }
 
 fn convert_buffer_to_planar_f32(
-    decoded: &AudioBufferRef<'_>,
+    decoded: &GenericAudioBufferRef<'_>,
 ) -> Result<Vec<Vec<f32>>, ProcessingError> {
-    let num_channels = decoded.spec().channels.count();
+    let num_channels = decoded.spec().channels().count();
     let mut planar_output: Vec<Vec<f32>> = Vec::with_capacity(num_channels);
 
     match decoded {
-        AudioBufferRef::F32(buf) => {
-            for plane in buf.planes().planes() {
+        GenericAudioBufferRef::F32(buf) => {
+            for plane in buf.iter_planes() {
                 planar_output.push(plane.to_vec());
             }
         }
-        AudioBufferRef::F64(buf) => {
-            for plane in buf.planes().planes() {
+        GenericAudioBufferRef::F64(buf) => {
+            for plane in buf.iter_planes() {
                 planar_output.push(plane.iter().map(|&s| s as f32).collect());
             }
         }
-        AudioBufferRef::S32(buf) => {
-            for plane in buf.planes().planes() {
+        GenericAudioBufferRef::S32(buf) => {
+            for plane in buf.iter_planes() {
                 planar_output.push(
                     plane
                         .iter()
@@ -682,8 +695,8 @@ fn convert_buffer_to_planar_f32(
                 );
             }
         }
-        AudioBufferRef::S24(buf) => {
-            for plane in buf.planes().planes() {
+        GenericAudioBufferRef::S24(buf) => {
+            for plane in buf.iter_planes() {
                 let max_value = 8388607.0; // 2^23 - 1
                 planar_output.push(
                     plane
@@ -693,8 +706,8 @@ fn convert_buffer_to_planar_f32(
                 );
             }
         }
-        AudioBufferRef::S16(buf) => {
-            for plane in buf.planes().planes() {
+        GenericAudioBufferRef::S16(buf) => {
+            for plane in buf.iter_planes() {
                 // 将有符号16位整数规范化到[-1.0, 1.0]范围
                 planar_output.push(
                     plane
@@ -704,8 +717,8 @@ fn convert_buffer_to_planar_f32(
                 );
             }
         }
-        AudioBufferRef::U8(buf) => {
-            for plane in buf.planes().planes() {
+        GenericAudioBufferRef::U8(buf) => {
+            for plane in buf.iter_planes() {
                 // 将无符号8位整数规范化到[-1.0, 1.0]范围
                 // u8范围是[0, 255]，需要先转换到[-128, 127]
                 planar_output.push(

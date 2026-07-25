@@ -8,7 +8,7 @@ license     = "MIT"
 name        = "audio-loudness-batch-normalize"
 readme      = "README.md"
 repository  = "https://github.com/lxl66566/audio-loudness-batch-normalize"
-version     = "0.3.2"
+version     = "0.3.3"
 
 [dependencies]
 anyhow            = { version = "1.0", optional = true }
@@ -18,17 +18,17 @@ hound             = "3.5"
 indicatif         = { version = "0.18", features = ["rayon"] }
 log               = "0.4"
 pathdiff          = "0.2"
-pretty_env_logger = "0.5"
+pretty_env_logger = { version = "0.5", optional = true }
 rand              = "0.10"
 rayon             = "1.12"
 strum_macros      = "0.28"
-symphonia         = { version = "0.5", features = ["all-codecs", "all-formats"] }
+symphonia         = { version = "0.6", features = ["all-codecs", "all-formats"] }
 thiserror         = "2.0"
 vorbis_rs         = "0.5"
 walkdir           = "2"
 
 [features]
-bin  = ["clap", "anyhow"]
+bin  = ["clap", "anyhow", "pretty_env_logger"]
 simd = ["symphonia/opt-simd"]
 
 [[bin]]
