@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 use symphonia::core::errors::Error as SymphoniaError;
 
-#[warn(dead_code)]
 #[derive(thiserror::Error, Debug)]
 pub enum MeasurementError {
     #[error("Symphonia error: {0}")]
@@ -16,7 +15,6 @@ pub enum MeasurementError {
     UnsupportedFormat,
 }
 
-#[warn(dead_code)]
 #[derive(thiserror::Error, Debug)]
 pub enum WritingError {
     #[error("Writing wav Error: {0}")]
@@ -27,7 +25,6 @@ pub enum WritingError {
     Io(#[from] std::io::Error),
 }
 
-#[warn(dead_code)]
 #[derive(thiserror::Error, Debug)]
 pub enum ProcessingError {
     #[error("Symphonia error: {0}")]
@@ -50,7 +47,6 @@ pub enum ProcessingError {
     EbuR128(#[from] ebur128::Error),
 }
 
-#[warn(dead_code)]
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("Measurement failed: {source}")]
