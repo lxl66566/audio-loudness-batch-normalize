@@ -102,7 +102,7 @@ impl Default for NormalizationOptions {
         NormalizationOptions {
             input_dir: PathBuf::from("."),
             output_dir: None,
-            sample_percentage: 0.30,
+            sample_percentage: 1.00,
             trim_percentage: 0.30,
             target_lufs: None,
             true_peak_db: -1.5,
