@@ -9,16 +9,19 @@ use crate::{
     error::{Error, WritingError},
 };
 
-/// Helper for `decode_apply_gain_and_save`: collects all processed samples and saves them to a WAV file.
+/// Helper for `decode_apply_gain_and_save`: collects all processed samples and
+/// saves them to a WAV file.
 pub fn stream_to_wav_writer(
     format: &mut dyn symphonia::core::formats::FormatReader,
     decoder: &mut dyn symphonia::core::codecs::Decoder,
+    track_id: u32,
     final_linear_gain: f64,
     output_path: &Path,
     spec: SignalSpec,
 ) -> Result<(), Error> {
     // First, collect all the processed samples into a buffer.
-    let samples = collect_gained_samples(format, decoder, final_linear_gain, output_path)?;
+    let samples =
+        collect_gained_samples(format, decoder, track_id, final_linear_gain, output_path)?;
 
     // Define the specification for the output WAV file.
     let hound_spec = hound::WavSpec {
@@ -55,12 +58,14 @@ pub fn save_as_wav(path: &Path, spec: hound::WavSpec, samples: &[f32]) -> Result
 pub fn stream_to_ogg_writer(
     format: &mut dyn symphonia::core::formats::FormatReader,
     decoder: &mut dyn symphonia::core::codecs::Decoder,
+    track_id: u32,
     final_linear_gain: f64,
     output_path: &Path,
     spec: SignalSpec,
 ) -> Result<(), Error> {
     // OGG saving still requires collecting all samples due to vorbis-rs API.
-    let samples = collect_gained_samples(format, decoder, final_linear_gain, output_path)?;
+    let samples =
+        collect_gained_samples(format, decoder, track_id, final_linear_gain, output_path)?;
     save_as_ogg(output_path, spec.channels.count(), spec.rate, &samples).map_err(|e| {
         Error::Writing {
             path: output_path.to_path_buf(),
@@ -130,45 +135,52 @@ pub fn save_as_ogg(
 fn collect_gained_samples(
     format: &mut dyn symphonia::core::formats::FormatReader,
     decoder: &mut dyn symphonia::core::codecs::Decoder,
+    track_id: u32,
     final_linear_gain: f64,
     output_path: &Path, // for error context
 ) -> Result<Vec<f32>, Error> {
     let mut all_samples_interleaved = Vec::new();
     loop {
         match format.next_packet() {
-            Ok(packet) => match decoder.decode(&packet) {
-                Ok(decoded) => {
-                    let planar =
-                        convert_buffer_to_planar_f32(&decoded).map_err(|e| Error::Processing {
-                            path: output_path.to_path_buf(),
-                            source: e,
+            Ok(packet) => {
+                if packet.track_id() != track_id {
+                    continue;
+                }
+                match decoder.decode(&packet) {
+                    Ok(decoded) => {
+                        let planar = convert_buffer_to_planar_f32(&decoded).map_err(|e| {
+                            Error::Processing {
+                                path: output_path.to_path_buf(),
+                                source: e,
+                            }
                         })?;
 
-                    if planar.is_empty() || planar[0].is_empty() {
-                        continue;
-                    }
+                        if planar.is_empty() || planar[0].is_empty() {
+                            continue;
+                        }
 
-                    let num_frames = planar[0].len();
-                    let num_channels = planar.len();
+                        let num_frames = planar[0].len();
+                        let num_channels = planar.len();
 
-                    for frame_idx in 0..num_frames {
-                        for channel_idx in 0..num_channels {
-                            let sample = planar[channel_idx][frame_idx];
-                            let processed_sample = sample * final_linear_gain as f32;
-                            all_samples_interleaved.push(processed_sample);
+                        for frame_idx in 0..num_frames {
+                            for channel_idx in 0..num_channels {
+                                let sample = planar[channel_idx][frame_idx];
+                                let processed_sample = sample * final_linear_gain as f32;
+                                all_samples_interleaved.push(processed_sample);
+                            }
                         }
                     }
+                    Err(SymphoniaError::DecodeError(e)) => {
+                        warn!("Decode error during sample collection: {e}")
+                    }
+                    Err(e) => {
+                        return Err(Error::Processing {
+                            path: output_path.to_path_buf(),
+                            source: e.into(),
+                        });
+                    }
                 }
-                Err(SymphoniaError::DecodeError(e)) => {
-                    warn!("Decode error during sample collection: {e}")
-                }
-                Err(e) => {
-                    return Err(Error::Processing {
-                        path: output_path.to_path_buf(),
-                        source: e.into(),
-                    });
-                }
-            },
+            }
             Err(SymphoniaError::IoError(ref e))
                 if e.kind() == std::io::ErrorKind::UnexpectedEof =>
             {

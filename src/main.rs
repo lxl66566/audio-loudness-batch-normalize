@@ -1,8 +1,9 @@
+use std::path::PathBuf;
+
 use anyhow::Result;
 use audio_loudness_batch_normalize::{NormalizationOptions, normalize_folder_loudness};
 use clap::Parser;
 use log::{error, info};
-use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -14,7 +15,8 @@ struct Cli {
     #[arg(short, long)]
     output: Option<PathBuf>,
 
-    /// percentage of files to sample for calculating target loudness, default to sample all files
+    /// percentage of files to sample for calculating target loudness, default
+    /// to sample all files
     #[arg(short, long, default_value_t = 1.00)]
     sample_percentage: f64,
 

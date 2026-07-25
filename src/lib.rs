@@ -423,6 +423,7 @@ fn measure_peak_after_gain(
             .ok_or(ProcessingError::MissingChannelSpec)?,
     );
 
+    let track_id = track.id;
     let mut decoder =
         symphonia::default::get_codecs().make(&track.codec_params, &Default::default())?;
 
@@ -432,26 +433,31 @@ fn measure_peak_after_gain(
 
     loop {
         match format.next_packet() {
-            Ok(packet) => match decoder.decode(&packet) {
-                Ok(decoded) => {
-                    let current_planar = convert_buffer_to_planar_f32(&decoded)?;
-
-                    // Apply gain to a temporary buffer for measurement
-                    let gained_planar: Vec<Vec<f32>> = current_planar
-                        .iter()
-                        .map(|plane| plane.iter().map(|&s| s * linear_gain as f32).collect())
-                        .collect();
-
-                    // Feed EBU R128 for true peak measurement
-                    let plane_slices: Vec<&[f32]> =
-                        gained_planar.iter().map(|v| v.as_slice()).collect();
-                    ebu_state_true_peak.add_frames_planar_f32(&plane_slices)?;
+            Ok(packet) => {
+                if packet.track_id() != track_id {
+                    continue;
                 }
-                Err(SymphoniaError::DecodeError(e)) => {
-                    warn!("Decode error during peak measurement: {e}")
+                match decoder.decode(&packet) {
+                    Ok(decoded) => {
+                        let current_planar = convert_buffer_to_planar_f32(&decoded)?;
+
+                        // Apply gain to a temporary buffer for measurement
+                        let gained_planar: Vec<Vec<f32>> = current_planar
+                            .iter()
+                            .map(|plane| plane.iter().map(|&s| s * linear_gain as f32).collect())
+                            .collect();
+
+                        // Feed EBU R128 for true peak measurement
+                        let plane_slices: Vec<&[f32]> =
+                            gained_planar.iter().map(|v| v.as_slice()).collect();
+                        ebu_state_true_peak.add_frames_planar_f32(&plane_slices)?;
+                    }
+                    Err(SymphoniaError::DecodeError(e)) => {
+                        warn!("Decode error during peak measurement: {e}")
+                    }
+                    Err(e) => return Err(ProcessingError::Symphonia(e)),
                 }
-                Err(e) => return Err(ProcessingError::Symphonia(e)),
-            },
+            }
             Err(SymphoniaError::IoError(ref e))
                 if e.kind() == std::io::ErrorKind::UnexpectedEof =>
             {
@@ -502,6 +508,7 @@ fn decode_apply_gain_and_save(
             source: ProcessingError::NoTrack(input_path.to_path_buf()),
         })?;
 
+    let track_id = track.id;
     let mut decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &Default::default())
         .map_err(|e| Error::Processing {
@@ -515,6 +522,7 @@ fn decode_apply_gain_and_save(
             stream_to_ogg_writer(
                 &mut *format,
                 &mut *decoder,
+                track_id,
                 final_linear_gain,
                 output_path,
                 spec,
@@ -525,6 +533,7 @@ fn decode_apply_gain_and_save(
             stream_to_wav_writer(
                 &mut *format,
                 &mut *decoder,
+                track_id,
                 final_linear_gain,
                 output_path,
                 spec,
@@ -560,6 +569,7 @@ pub fn measure_single_file_loudness(path: impl AsRef<Path>) -> Result<f64, Measu
         .channels
         .ok_or(MeasurementError::UnsupportedFormat)?;
     let channel_count = channels.count();
+    let track_id = track.id;
 
     let mut ebu_state = EbuR128::new(channel_count as u32, sample_rate, Mode::I)
         .map_err(MeasurementError::EbuR128)?;
@@ -572,25 +582,32 @@ pub fn measure_single_file_loudness(path: impl AsRef<Path>) -> Result<f64, Measu
 
     loop {
         match format.next_packet() {
-            Ok(packet) => match decoder.decode(&packet) {
-                Ok(decoded) => match convert_buffer_to_planar_f32(&decoded) {
-                    Ok(planar_f32) => {
-                        let plane_slices: Vec<&[f32]> =
-                            planar_f32.iter().map(|v| v.as_slice()).collect();
-                        if let Err(e) = ebu_state.add_frames_planar_f32(&plane_slices) {
-                            warn!("EBU R128 add_frames failed: {e}. Skipping chunk.");
+            Ok(packet) => {
+                if packet.track_id() != track_id {
+                    continue;
+                }
+                match decoder.decode(&packet) {
+                    Ok(decoded) => match convert_buffer_to_planar_f32(&decoded) {
+                        Ok(planar_f32) => {
+                            let plane_slices: Vec<&[f32]> =
+                                planar_f32.iter().map(|v| v.as_slice()).collect();
+                            if let Err(e) = ebu_state.add_frames_planar_f32(&plane_slices) {
+                                warn!("EBU R128 add_frames failed: {e}. Skipping chunk.");
+                            }
+                            update_rms_accumulators(
+                                &planar_f32,
+                                &mut rms_sum_of_squares,
+                                &mut rms_total_samples,
+                            );
                         }
-                        update_rms_accumulators(
-                            &planar_f32,
-                            &mut rms_sum_of_squares,
-                            &mut rms_total_samples,
-                        );
+                        Err(e) => warn!("Buffer conversion failed: {e}. Skipping chunk."),
+                    },
+                    Err(SymphoniaError::DecodeError(e)) => {
+                        warn!("Decode error: {e}. Skipping packet.")
                     }
-                    Err(e) => warn!("Buffer conversion failed: {e}. Skipping chunk."),
-                },
-                Err(SymphoniaError::DecodeError(e)) => warn!("Decode error: {e}. Skipping packet."),
-                Err(e) => return Err(MeasurementError::Symphonia(e)),
-            },
+                    Err(e) => return Err(MeasurementError::Symphonia(e)),
+                }
+            }
             Err(SymphoniaError::IoError(ref e))
                 if e.kind() == std::io::ErrorKind::UnexpectedEof =>
             {

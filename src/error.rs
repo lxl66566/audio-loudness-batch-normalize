@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+
 use symphonia::core::errors::Error as SymphoniaError;
 
 #[derive(thiserror::Error, Debug)]
