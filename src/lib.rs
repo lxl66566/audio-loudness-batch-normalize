@@ -141,25 +141,6 @@ fn progress_style() -> ProgressStyle {
 
 /// Normalize the loudness of all audio files in a folder
 pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<(), Error> {
-    if let Some(num_threads) = options.num_threads {
-        if num_threads > 0 {
-            let rayon_init_result = rayon::ThreadPoolBuilder::new()
-                .num_threads(num_threads)
-                .build_global();
-            if let Err(e) = rayon_init_result {
-                warn!(
-                    "Failed to configure Rayon thread pool: {e}. Using default number of threads."
-                );
-            } else {
-                info!("Using {num_threads} threads for processing.");
-            }
-        } else {
-            info!("Using default number of threads.");
-        }
-    } else {
-        info!("Using default number of threads.");
-    }
-
     // 1. Validate options
     validate_options(options)?;
 
@@ -171,6 +152,18 @@ pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<(), E
         return Ok(());
     }
     info!("Found {} audio files.", all_audio_files.len());
+
+    // A local pool avoids mutating the global rayon pool; num_threads == 0
+    // falls back to rayon's default thread count.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(options.num_threads.unwrap_or(0))
+        .build()
+        .map_err(|e| Error::InvalidOptions(format!("Failed to build thread pool: {e}")))?;
+    if let Some(n) = options.num_threads.filter(|&n| n > 0) {
+        info!("Using {n} threads for processing.");
+    } else {
+        info!("Using default number of threads.");
+    }
 
     // --- Target Loudness Calculation ---
     let (target_lufs, loudness_measurements_cache) = match options.target_lufs {
@@ -208,21 +201,23 @@ pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<(), E
             sample_pb.set_message("Measuring samples");
 
             let loudness_measurements: HashMap<PathBuf, Result<AudioStats, MeasurementError>> =
-                sampled_files
-                    .par_iter()
-                    .progress_with(sample_pb.clone())
-                    .map(|path| {
-                        let loudness_result = measure_single_file_stats(path);
-                        if let Err(e) = &loudness_result {
-                            warn!(
-                                "Failed to measure loudness for sample {:?}: {}",
-                                path.file_name().unwrap_or_default(),
-                                e
-                            );
-                        }
-                        (path.to_path_buf(), loudness_result)
-                    })
-                    .collect();
+                pool.install(|| {
+                    sampled_files
+                        .par_iter()
+                        .progress_with(sample_pb.clone())
+                        .map(|path| {
+                            let loudness_result = measure_single_file_stats(path);
+                            if let Err(e) = &loudness_result {
+                                warn!(
+                                    "Failed to measure loudness for sample {:?}: {}",
+                                    path.file_name().unwrap_or_default(),
+                                    e
+                                );
+                            }
+                            (path.to_path_buf(), loudness_result)
+                        })
+                        .collect()
+                });
             sample_pb.finish_with_message("Sample measurement done");
 
             // 5. Calculate target loudness (trimmed mean)
@@ -260,20 +255,22 @@ pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<(), E
     process_pb.set_style(progress_style());
     process_pb.set_message("Processing files");
 
-    let results: Vec<Result<(), Error>> = all_audio_files
-        .par_iter()
-        .progress_with(process_pb.clone())
-        .map(|path| {
-            process_single_file(
-                path,
-                target_lufs,
-                options.true_peak_db,
-                &options.input_dir,
-                &options.output_dir,
-                &loudness_measurements_cache,
-            )
-        })
-        .collect();
+    let results: Vec<Result<(), Error>> = pool.install(|| {
+        all_audio_files
+            .par_iter()
+            .progress_with(process_pb.clone())
+            .map(|path| {
+                process_single_file(
+                    path,
+                    target_lufs,
+                    options.true_peak_db,
+                    &options.input_dir,
+                    &options.output_dir,
+                    &loudness_measurements_cache,
+                )
+            })
+            .collect()
+    });
     process_pb.finish_with_message("Processing done");
 
     // 7. Report final status and errors
@@ -375,6 +372,11 @@ pub fn process_single_file(
     // For non-WAV formats that will be converted, change the extension.
     if !matches!(file_format, AudioFormat::Wav | AudioFormat::Ogg) {
         output_path.set_extension("wav");
+        if output_base_dir.is_none() {
+            warn!(
+                "In-place mode: {file_name_str} is converted to WAV, but the original file is kept unnormalized and will be processed again on the next run."
+            );
+        }
     }
 
     // Ensure parent directory exists
@@ -579,7 +581,7 @@ fn validate_options(options: &NormalizationOptions) -> Result<(), Error> {
         }
     }
 
-    if !(0.0..=1.0).contains(&options.sample_percentage) {
+    if !(0.0..=1.0).contains(&options.sample_percentage) || options.sample_percentage == 0.0 {
         return Err(Error::InvalidOptions(format!(
             "Sample percentage must be in the range (0.0, 1.0]: {}",
             options.sample_percentage

@@ -43,7 +43,8 @@ Options:
 
 ## Tip
 
-- Only WAV, OGG encoders are supported currently. If the input format is not OGG, the output will be in WAV format and may need to be manually converted.
+- Currently, only WAV and OGG encoders are supported. If the input format is not OGG, the output will be in WAV format, and the original file will be preserved as is. If you need the equalized audio to retain its original format, you must convert it manually.
+- Audio metadata (tags) is not preserved during format conversion.
 
 ## Theory
 
@@ -52,7 +53,3 @@ Options:
    - If the audio's active duration is too short, the EBU R128 algorithm may return NaN, in which case it will fall back to RMS loudness calculation.
 3. Calculate the trimmed mean of audio loudness based on `trim_percentage`. For example, setting `trim_percentage` to 0.3 will remove the loudness values in the top 15% and bottom 15% of the samples.
 4. Adjust the audio loudness using the target loudness (LUFS) and the EBU R128 algorithm.
-
-## Special Thanks
-
-Gemini 2.5 Pro Preview 03-25

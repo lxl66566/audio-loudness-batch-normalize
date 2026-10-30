@@ -43,7 +43,8 @@ loudness-normalize <输入目录> [选项]
 
 ## Tip
 
-- 当前仅支持 WAV、OGG 的编码器，如果输入格式不是 OGG 格式，输出将会是 WAV 格式。如果你需要保持原先的格式，可能需要手动转换。
+- 当前仅支持 WAV、OGG 的编码器，如果输入格式不是 OGG 格式，输出将会是 WAV 格式，原文件将被原样保留。如果你需要让均衡后的音频保持原先的格式，需要手动转换。
+- 格式转换时音频元数据（tags）不会被保留。
 
 ## Theory
 
@@ -52,7 +53,3 @@ loudness-normalize <输入目录> [选项]
    - 如果音频有声时间过短，使用 EBU R128 算法可能会算出 NaN 值，此时将 fallback 到 RMS 响度计算。
 3. 依据 trim_percentage 进行音频响度截尾均值计算。例如，将 trim_percentage 设为 0.3，则会在样本中去除响度在最高 15% 和最低 15% 的部分。
 4. 使用目标响度（LUFS）和 EBU R128 算法进行音频响度调整。
-
-## Special Thanks
-
-Gemini 2.5 Pro Preview 03-25
