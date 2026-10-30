@@ -17,7 +17,7 @@ fn main() -> Result<()> {
     let options = Cli::parse().options;
 
     info!("Starting loudness normalization with options:");
-    info!("  Input Directory: {:?}", options.input_dir);
+    info!("  Input Directory: {}", options.input_dir.display());
     info!("  Output Directory: {:?}", options.output_dir);
     info!(
         "  Sample Percentage: {}%",
@@ -39,14 +39,14 @@ fn main() -> Result<()> {
     info!("---");
 
     match normalize_folder_loudness(&options) {
-        Ok(_) => {
+        Ok(()) => {
             info!("Normalization finished successfully!");
             Ok(())
-        }
+        },
         Err(e) => {
             error!("Normalization failed: {e}");
             Err(e)?
-        }
+        },
     }
 }
 

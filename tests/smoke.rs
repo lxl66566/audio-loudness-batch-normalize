@@ -1,3 +1,6 @@
+// Test signal generation narrows float amplitudes to integer samples with `as`.
+#![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+
 use std::{num::NonZero, path::Path};
 
 use audio_loudness_batch_normalize::{measure_single_file_stats, process_single_file};
@@ -15,7 +18,7 @@ fn write_sine_wav(path: &Path, amplitude: f32) {
     let mut writer = WavWriter::create(path, spec).unwrap();
     for t in 0..44_100 {
         let phase = 2.0 * std::f32::consts::PI * 440.0 * t as f32 / 44_100.0;
-        let sample = (amplitude * phase.sin() * i16::MAX as f32) as i16;
+        let sample = (amplitude * phase.sin() * f32::from(i16::MAX)) as i16;
         writer.write_sample(sample).unwrap();
     }
     writer.finalize().unwrap();

@@ -3,10 +3,14 @@ use std::{fs, io, path::Path};
 use log::warn;
 use symphonia::core::{
     audio::{Audio, GenericAudioBufferRef},
-    codecs::{CodecParameters, audio::AudioDecoder},
+    codecs::{
+        CodecParameters,
+        audio::{AudioDecoder, AudioDecoderOptions},
+    },
     errors::Error as SymphoniaError,
-    formats::{FormatReader, TrackType, probe::Hint},
-    io::MediaSourceStream,
+    formats::{FormatOptions, FormatReader, TrackType, probe::Hint},
+    io::{MediaSourceStream, MediaSourceStreamOptions},
+    meta::MetadataOptions,
 };
 
 use crate::error::DecodeError;
@@ -25,7 +29,7 @@ pub struct DecodedAudio {
 /// Opens an audio file and prepares a decoder for its default audio track.
 pub fn open(path: &Path) -> Result<DecodedAudio, DecodeError> {
     let file = fs::File::open(path)?;
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mss = MediaSourceStream::new(Box::new(file), MediaSourceStreamOptions::default());
 
     // The extension hint improves detection for files without magic numbers.
     let mut hint = Hint::new();
@@ -36,8 +40,8 @@ pub fn open(path: &Path) -> Result<DecodedAudio, DecodeError> {
     let format = symphonia::default::get_probe().probe(
         &hint,
         mss,
-        Default::default(),
-        Default::default(),
+        FormatOptions::default(),
+        MetadataOptions::default(),
     )?;
 
     let track = format
@@ -57,8 +61,8 @@ pub fn open(path: &Path) -> Result<DecodedAudio, DecodeError> {
         .map(|c| c.count() as u16)
         .ok_or(DecodeError::MissingChannelSpec)?;
     let track_id = track.id;
-    let decoder =
-        symphonia::default::get_codecs().make_audio_decoder(audio_params, &Default::default())?;
+    let decoder = symphonia::default::get_codecs()
+        .make_audio_decoder(audio_params, &AudioDecoderOptions::default())?;
 
     Ok(DecodedAudio {
         format,
@@ -89,7 +93,7 @@ impl DecodedAudio {
                 Ok(None) => break,
                 Err(SymphoniaError::IoError(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
                     break;
-                }
+                },
                 Err(e) => return Err(DecodeError::from(e).into()),
             };
             if packet.track_id != self.track_id {
@@ -100,7 +104,7 @@ impl DecodedAudio {
                 Err(SymphoniaError::DecodeError(e)) => {
                     warn!("Decode error: {e}. Skipping packet.");
                     continue;
-                }
+                },
                 Err(e) => return Err(DecodeError::from(e).into()),
             };
             let planar = convert_buffer_to_planar_f32(&decoded)?;
@@ -112,6 +116,9 @@ impl DecodedAudio {
         Ok(())
     }
 }
+
+/// Maximum absolute value of a signed 24-bit sample: 2^23 - 1.
+const MAX_S24: f32 = 8_388_607.0;
 
 /// Converts a decoded audio buffer to planar f32 samples normalized to
 /// [-1.0, 1.0].
@@ -126,12 +133,12 @@ pub(crate) fn convert_buffer_to_planar_f32(
             for plane in buf.iter_planes() {
                 planar_output.push(plane.to_vec());
             }
-        }
+        },
         GenericAudioBufferRef::F64(buf) => {
             for plane in buf.iter_planes() {
                 planar_output.push(plane.iter().map(|&s| s as f32).collect());
             }
-        }
+        },
         GenericAudioBufferRef::S32(buf) => {
             for plane in buf.iter_planes() {
                 planar_output.push(
@@ -141,28 +148,22 @@ pub(crate) fn convert_buffer_to_planar_f32(
                         .collect(),
                 );
             }
-        }
+        },
         GenericAudioBufferRef::S24(buf) => {
             for plane in buf.iter_planes() {
-                let max_value = 8388607.0; // 2^23 - 1
-                planar_output.push(
-                    plane
-                        .iter()
-                        .map(|&s| s.inner() as f32 / max_value)
-                        .collect(),
-                );
+                planar_output.push(plane.iter().map(|&s| s.inner() as f32 / MAX_S24).collect());
             }
-        }
+        },
         GenericAudioBufferRef::S16(buf) => {
             for plane in buf.iter_planes() {
                 planar_output.push(
                     plane
                         .iter()
-                        .map(|&s| (s as f32) / (i16::MAX as f32))
+                        .map(|&s| f32::from(s) / f32::from(i16::MAX))
                         .collect(),
                 );
             }
-        }
+        },
         GenericAudioBufferRef::U8(buf) => {
             for plane in buf.iter_planes() {
                 // Shift the unsigned range [0, 255] to signed [-128, 127]
@@ -170,11 +171,11 @@ pub(crate) fn convert_buffer_to_planar_f32(
                 planar_output.push(
                     plane
                         .iter()
-                        .map(|&s| ((s as i16 - 128) as f32) / 128.0)
+                        .map(|&s| f32::from(i16::from(s) - 128) / 128.0)
                         .collect(),
                 );
             }
-        }
+        },
         _ => return Err(DecodeError::UnsupportedBufferFormat),
     }
     Ok(planar_output)

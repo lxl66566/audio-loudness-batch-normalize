@@ -1,4 +1,11 @@
+// Audio sample conversion and loudness statistics use `as` casts between
+// integer and float domains by design; the magnitudes involved make them safe.
 #![allow(clippy::needless_range_loop)]
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 
 /// Module for opening and decoding audio files
 pub mod decode;
@@ -145,8 +152,11 @@ pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<(), E
     validate_options(options)?;
 
     // 2. Discover audio files
-    info!("Discovering audio files in {:?}...", options.input_dir);
-    let all_audio_files = find_audio_files(&options.input_dir)?;
+    info!(
+        "Discovering audio files in {}...",
+        options.input_dir.display()
+    );
+    let all_audio_files = find_audio_files(&options.input_dir);
     if all_audio_files.is_empty() {
         info!("No audio files found.");
         return Ok(());
@@ -166,75 +176,73 @@ pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<(), E
     }
 
     // --- Target Loudness Calculation ---
-    let (target_lufs, loudness_measurements_cache) = match options.target_lufs {
-        Some(t) => {
-            info!("Using user-provided Target Loudness: {t:.2} LUFS");
-            (t, None)
+    let (target_lufs, loudness_measurements_cache) = if let Some(t) = options.target_lufs {
+        info!("Using user-provided Target Loudness: {t:.2} LUFS");
+        (t, None)
+    } else {
+        // 3. Select sample files
+        let sample_size =
+            (all_audio_files.len() as f64 * options.sample_percentage).ceil() as usize;
+        if sample_size == 0 {
+            return Err(Error::InvalidOptions(
+                "Sample size is 0, please check your sample percentage.".to_string(),
+            ));
         }
-        None => {
-            // 3. Select sample files
-            let sample_size =
-                (all_audio_files.len() as f64 * options.sample_percentage).ceil() as usize;
-            if sample_size == 0 {
-                return Err(Error::InvalidOptions(
-                    "Sample size is 0, please check your sample percentage.".to_string(),
-                ));
-            }
-            let sampled_files: Vec<&Path> = if sample_size >= all_audio_files.len() {
-                all_audio_files.iter().map(PathBuf::as_path).collect()
-            } else {
-                let mut rng = rand::rng();
-                all_audio_files
-                    .sample(&mut rng, sample_size)
-                    .map(PathBuf::as_path)
+        let sampled_files: Vec<&Path> = if sample_size >= all_audio_files.len() {
+            all_audio_files.iter().map(PathBuf::as_path).collect()
+        } else {
+            let mut rng = rand::rng();
+            all_audio_files
+                .sample(&mut rng, sample_size)
+                .map(PathBuf::as_path)
+                .collect()
+        };
+        info!(
+            "Selected {} files for target loudness calculation.",
+            sampled_files.len()
+        );
+
+        // 4. Measure loudness of sampled files (in parallel)
+        info!("Measuring loudness of sampled files...");
+        let sample_pb = ProgressBar::new(sampled_files.len() as u64);
+        sample_pb.set_style(progress_style());
+        sample_pb.set_message("Measuring samples");
+
+        let loudness_measurements: HashMap<PathBuf, Result<AudioStats, MeasurementError>> = pool
+            .install(|| {
+                sampled_files
+                    .par_iter()
+                    .progress_with(sample_pb.clone())
+                    .map(|path| {
+                        let loudness_result = measure_single_file_stats(path);
+                        if let Err(e) = &loudness_result {
+                            warn!(
+                                "Failed to measure loudness for sample {:?}: {}",
+                                path.file_name().unwrap_or_default(),
+                                e
+                            );
+                        }
+                        (path.to_path_buf(), loudness_result)
+                    })
                     .collect()
-            };
-            info!(
-                "Selected {} files for target loudness calculation.",
-                sampled_files.len()
-            );
+            });
+        sample_pb.finish_with_message("Sample measurement done");
 
-            // 4. Measure loudness of sampled files (in parallel)
-            info!("Measuring loudness of sampled files...");
-            let sample_pb = ProgressBar::new(sampled_files.len() as u64);
-            sample_pb.set_style(progress_style());
-            sample_pb.set_message("Measuring samples");
+        // 5. Calculate target loudness (trimmed mean)
+        let calculated_target =
+            calculate_target_loudness(&loudness_measurements, options.trim_percentage).map_err(
+                |e| Error::Processing {
+                    path: options.input_dir.clone(),
+                    source: e,
+                },
+            )?;
+        info!(
+            "Calculated Target Loudness ({}% trimmed mean): {:.2} LUFS",
+            options.trim_percentage * 100.0,
+            calculated_target
+        );
 
-            let loudness_measurements: HashMap<PathBuf, Result<AudioStats, MeasurementError>> =
-                pool.install(|| {
-                    sampled_files
-                        .par_iter()
-                        .progress_with(sample_pb.clone())
-                        .map(|path| {
-                            let loudness_result = measure_single_file_stats(path);
-                            if let Err(e) = &loudness_result {
-                                warn!(
-                                    "Failed to measure loudness for sample {:?}: {}",
-                                    path.file_name().unwrap_or_default(),
-                                    e
-                                );
-                            }
-                            (path.to_path_buf(), loudness_result)
-                        })
-                        .collect()
-                });
-            sample_pb.finish_with_message("Sample measurement done");
-
-            // 5. Calculate target loudness (trimmed mean)
-            let calculated_target =
-                calculate_target_loudness(&loudness_measurements, options.trim_percentage)
-                    .map_err(|e| Error::Processing {
-                        path: options.input_dir.to_path_buf(),
-                        source: e,
-                    })?;
-            info!(
-                "Calculated Target Loudness ({}% trimmed mean): {:.2} LUFS",
-                options.trim_percentage * 100.0,
-                calculated_target
-            );
-
-            (calculated_target, Some(loudness_measurements))
-        }
+        (calculated_target, Some(loudness_measurements))
     };
 
     if options.measure_only {
@@ -278,11 +286,11 @@ pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<(), E
     let mut error_count = 0;
     for result in results {
         match result {
-            Ok(_) => success_count += 1,
+            Ok(()) => success_count += 1,
             Err(e) => {
                 error!("Error: {e}"); // Log the detailed error
                 error_count += 1;
-            }
+            },
         }
     }
 
@@ -290,7 +298,7 @@ pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<(), E
 
     if error_count > 0 {
         Err(Error::Processing {
-            path: options.input_dir.to_path_buf(),
+            path: options.input_dir.clone(),
             source: ProcessingError::FilesFailed(error_count),
         })
     } else {
@@ -300,6 +308,9 @@ pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<(), E
 
 /// Main orchestration function for processing a single file using the two-pass
 /// method.
+// The cache is built internally with the default hasher; generalizing it over
+// `BuildHasher` would leak a type parameter into every call site.
+#[allow(clippy::implicit_hasher)]
 pub fn process_single_file(
     input_path: impl AsRef<Path>,
     target_lufs: f64,
@@ -327,7 +338,7 @@ pub fn process_single_file(
                 path: input_path.to_path_buf(),
                 source: MeasurementError::SamplingFailed,
             });
-        }
+        },
         None => measure_single_file_stats(input_path).map_err(|e| Error::Measurement {
             path: input_path.to_path_buf(),
             source: e,
@@ -351,7 +362,8 @@ pub fn process_single_file(
     let final_linear_gain = compute_gain(stats, target_lufs, target_peak_db);
 
     debug!(
-        "  -> File: {file_name_str}, Current LUFS: {current_lufs:.2}, Target LUFS: {target_lufs:.2}, Final Combined Linear Gain: {final_linear_gain:.3}x"
+        "  -> File: {file_name_str}, Current LUFS: {current_lufs:.2}, Target LUFS: \
+         {target_lufs:.2}, Final Combined Linear Gain: {final_linear_gain:.3}x"
     );
 
     // --- PROCESSING & SAVING ---
@@ -365,7 +377,7 @@ pub fn process_single_file(
                     source: std::io::Error::other("Failed to calculate relative path"),
                 })?;
             obd.as_ref().join(relative_path)
-        }
+        },
         None => input_path.to_path_buf(),
     };
 
@@ -374,7 +386,8 @@ pub fn process_single_file(
         output_path.set_extension("wav");
         if output_base_dir.is_none() {
             warn!(
-                "In-place mode: {file_name_str} is converted to WAV, but the original file is kept unnormalized and will be processed again on the next run."
+                "In-place mode: {file_name_str} is converted to WAV, but the original file is \
+                 kept unnormalized and will be processed again on the next run."
             );
         }
     }
@@ -390,7 +403,10 @@ pub fn process_single_file(
     // Decode, apply final gain, and save in a streaming manner
     decode_apply_gain_and_save(input_path, &output_path, &file_format, final_linear_gain)?;
 
-    debug!("Successfully wrote normalized file to {output_path:?}");
+    debug!(
+        "Successfully wrote normalized file to {}",
+        output_path.display()
+    );
     Ok(())
 }
 
@@ -435,7 +451,7 @@ pub fn measure_single_file_stats(path: impl AsRef<Path>) -> Result<AudioStats, M
     let path = path.as_ref();
     let mut audio = decode::open(path)?;
     let mut ebu_state = EbuR128::new(
-        audio.channels as u32,
+        u32::from(audio.channels),
         audio.sample_rate,
         Mode::I | Mode::TRUE_PEAK,
     )?;
@@ -444,7 +460,7 @@ pub fn measure_single_file_stats(path: impl AsRef<Path>) -> Result<AudioStats, M
     let mut rms_total_samples = 0u64;
 
     audio.for_each_packet(|planar| {
-        let plane_slices: Vec<&[f32]> = planar.iter().map(|v| v.as_slice()).collect();
+        let plane_slices: Vec<&[f32]> = planar.iter().map(Vec::as_slice).collect();
         if let Err(e) = ebu_state.add_frames_planar_f32(&plane_slices) {
             warn!("EBU R128 add_frames failed: {e}. Skipping chunk.");
         }
@@ -457,25 +473,19 @@ pub fn measure_single_file_stats(path: impl AsRef<Path>) -> Result<AudioStats, M
         _ => {
             debug!("EBU R128 failed or gave non-finite value. Falling back to RMS.");
             calculate_rms_dbfs(rms_sum_of_squares, rms_total_samples)
-        }
+        },
     };
 
     // Maximum true peak across all channels. `EbuR128::true_peak` returns a
     // linear amplitude; convert it to dBTP. If the EBU R128 state is broken,
     // fall back to negative infinity (no peak limiting will be applied).
-    let channel_count = audio.channels as usize;
-    let true_peak_db = (0..channel_count)
-        .map(|i| ebu_state.true_peak(i as u32))
+    let true_peak_db = (0..u32::from(audio.channels))
+        .map(|i| ebu_state.true_peak(i))
         .collect::<Result<Vec<_>, _>>()
-        .map(|peaks| {
+        .map_or(f64::NEG_INFINITY, |peaks| {
             let linear = peaks.into_iter().fold(0.0_f64, f64::max);
-            if linear > 0.0 {
-                20.0 * linear.log10()
-            } else {
-                f64::NEG_INFINITY
-            }
-        })
-        .unwrap_or(f64::NEG_INFINITY);
+            if linear > 0.0 { 20.0 * linear.log10() } else { f64::NEG_INFINITY }
+        });
 
     Ok(AudioStats {
         loudness_lufs,
@@ -495,7 +505,7 @@ fn update_rms_accumulators(
 ) {
     for channel_buffer in planar_f32 {
         for sample in channel_buffer {
-            *sum_of_squares += (*sample as f64) * (*sample as f64);
+            *sum_of_squares += f64::from(*sample) * f64::from(*sample);
         }
         *total_samples += channel_buffer.len() as u64;
     }
@@ -563,20 +573,21 @@ fn calculate_target_loudness(
 fn validate_options(options: &NormalizationOptions) -> Result<(), Error> {
     if !options.input_dir.is_dir() {
         return Err(Error::InvalidOptions(format!(
-            "Input path is not a valid directory: {:?}",
-            options.input_dir
+            "Input path is not a valid directory: {}",
+            options.input_dir.display()
         )));
     }
     if let Some(output_dir) = &options.output_dir {
         if !output_dir.exists() {
             fs::create_dir_all(output_dir).map_err(|e| Error::Io {
-                path: output_dir.to_path_buf(),
+                path: output_dir.clone(),
                 source: e,
             })?;
-            info!("Created output directory: {output_dir:?}");
+            info!("Created output directory: {}", output_dir.display());
         } else if !output_dir.is_dir() {
             return Err(Error::InvalidOptions(format!(
-                "Output path exists but is not a directory: {output_dir:?}"
+                "Output path exists but is not a directory: {}",
+                output_dir.display()
             )));
         }
     }
@@ -595,7 +606,8 @@ fn validate_options(options: &NormalizationOptions) -> Result<(), Error> {
     }
     if options.true_peak_db > 0.0 {
         warn!(
-            "Target true peak {:.1} dBTP is above 0 dBFS. This will likely cause clipping in standard formats.",
+            "Target true peak {:.1} dBTP is above 0 dBFS. This will likely cause clipping in \
+             standard formats.",
             options.true_peak_db
         );
     }
@@ -609,12 +621,12 @@ fn validate_options(options: &NormalizationOptions) -> Result<(), Error> {
 ///
 /// # Returns
 /// Vector of paths to the found audio files
-fn find_audio_files(input_dir: impl AsRef<Path>) -> Result<Vec<PathBuf>, Error> {
+fn find_audio_files(input_dir: impl AsRef<Path>) -> Vec<PathBuf> {
     let mut audio_files = Vec::new();
 
     for entry in WalkDir::new(input_dir)
         .into_iter()
-        .filter_map(|e| e.ok()) // Filter out directory reading errors
+        .filter_map(Result::ok) // Filter out directory reading errors
         .filter(|e| e.file_type().is_file())
     {
         let path = entry.path();
@@ -622,7 +634,7 @@ fn find_audio_files(input_dir: impl AsRef<Path>) -> Result<Vec<PathBuf>, Error> 
             audio_files.push(path.to_path_buf());
         }
     }
-    Ok(audio_files)
+    audio_files
 }
 
 #[cfg(test)]
@@ -726,8 +738,8 @@ mod tests {
         assert_eq!(planar.len(), 2);
         assert_eq!(planar[0][0], 0.0);
         assert_eq!(planar[0][1], 1.0);
-        assert_eq!(planar[1][0], i16::MIN as f32 / i16::MAX as f32);
-        assert_eq!(planar[1][1], -1.0 / i16::MAX as f32);
+        assert_eq!(planar[1][0], f32::from(i16::MIN) / f32::from(i16::MAX));
+        assert_eq!(planar[1][1], -1.0 / f32::from(i16::MAX));
     }
 
     #[test]
