@@ -11,12 +11,7 @@ struct Cli {
 }
 
 fn main() -> Result<()> {
-    _ = pretty_env_logger::formatted_builder()
-        .filter_level(log::LevelFilter::Info)
-        .format_timestamp_secs()
-        .parse_filters("symphonia=error")
-        .parse_default_env()
-        .try_init();
+    init_logger()?;
 
     // --- Configuration ---
     let options = Cli::parse().options;
@@ -53,4 +48,24 @@ fn main() -> Result<()> {
             Err(e)?
         }
     }
+}
+
+/// Routes `log` crate records to spdlog. Defaults to info level with symphonia
+/// at error level; `RUST_LOG` overrides the defaults.
+fn init_logger() -> Result<()> {
+    spdlog::init_log_crate_proxy()?;
+
+    let mut filter = env_filter::Builder::new();
+    filter
+        .filter_level(log::LevelFilter::Info)
+        .filter_module("symphonia", log::LevelFilter::Error);
+    if let Ok(spec) = std::env::var("RUST_LOG") {
+        filter.parse(&spec);
+    }
+    spdlog::log_crate_proxy().set_filter(Some(filter.build()));
+
+    // Let the filter decide; the default logger accepts all levels.
+    spdlog::default_logger().set_level_filter(spdlog::LevelFilter::All);
+    log::set_max_level(log::LevelFilter::Trace);
+    Ok(())
 }
