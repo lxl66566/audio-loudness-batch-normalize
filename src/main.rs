@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use anyhow::Result;
 use audio_loudness_batch_normalize::{NormalizationOptions, normalize_folder_loudness};
 use clap::Parser;
@@ -8,38 +6,8 @@ use log::{error, info};
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
-    /// input directory
-    input: PathBuf,
-
-    /// output directory, default to override input audios
-    #[arg(short, long)]
-    output: Option<PathBuf>,
-
-    /// percentage of files to sample for calculating target loudness, default
-    /// to sample all files
-    #[arg(short, long, default_value_t = 1.00)]
-    sample_percentage: f64,
-
-    /// trim percentage for calculating target loudness
-    #[arg(long, default_value_t = 0.30)]
-    trim_percentage: f64,
-
-    /// target loudness in LUFS, default to automatic calculation
-    #[arg(long)]
-    target_lufs: Option<f64>,
-
-    /// target true peak in dBTP
-    #[arg(long, default_value_t = -1.5)]
-    true_peak_db: f64,
-
-    /// number of threads to use, default to CPU core count
-    #[arg(short, long)]
-    threads: Option<usize>,
-
-    /// only measure and report the target loudness (LUFS) without writing
-    /// normalized files
-    #[arg(short = 'n', long, default_value_t = false)]
-    measure_only: bool,
+    #[command(flatten)]
+    options: NormalizationOptions,
 }
 
 fn main() -> Result<()> {
@@ -50,19 +18,8 @@ fn main() -> Result<()> {
         .parse_default_env()
         .try_init();
 
-    let cli = Cli::parse();
-
     // --- Configuration ---
-    let options = NormalizationOptions {
-        output_dir: cli.output,
-        input_dir: cli.input,
-        sample_percentage: cli.sample_percentage,
-        trim_percentage: cli.trim_percentage,
-        target_lufs: cli.target_lufs,
-        true_peak_db: cli.true_peak_db,
-        num_threads: cli.threads,
-        measure_only: cli.measure_only,
-    };
+    let options = Cli::parse().options;
 
     info!("Starting loudness normalization with options:");
     info!("  Input Directory: {:?}", options.input_dir);

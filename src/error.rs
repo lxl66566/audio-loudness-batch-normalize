@@ -21,16 +21,12 @@ pub enum DecodeError {
 
 #[derive(thiserror::Error, Debug)]
 pub enum MeasurementError {
-    #[error("Symphonia error: {0}")]
-    Symphonia(#[from] SymphoniaError),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("EBU R128 error: {0}")]
     EbuR128(#[from] ebur128::Error),
-    #[error("No compatible audio track found")]
-    NoTrack,
-    #[error("Unsupported sample format")]
-    UnsupportedFormat,
+    #[error("Decode error: {0}")]
+    Decode(#[from] DecodeError),
     #[error("measurement already failed during the sampling phase")]
     SamplingFailed,
 }
