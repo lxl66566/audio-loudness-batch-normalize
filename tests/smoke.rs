@@ -4,7 +4,8 @@
 use std::{num::NonZero, path::Path};
 
 use audio_loudness_batch_normalize::{
-    EncodeConfig, WavBitDepth, measure_single_file_stats, process_single_file,
+    EncodeConfig, NormalizationOptions, WavBitDepth, measure_single_file_stats,
+    normalize_folder_loudness, process_single_file,
 };
 use hound::{SampleFormat, WavSpec, WavWriter};
 use vorbis_rs::VorbisEncoderBuilder;
@@ -203,4 +204,104 @@ fn ogg_quality_controls_output_size() {
         "quality 9 ({size_high} bytes) should produce a larger file than quality 1 ({size_low} \
          bytes)"
     );
+}
+
+#[test]
+fn run_report_json_records_verification() {
+    let dir = tempfile::tempdir().unwrap();
+    // Both amplitudes stay far enough from the peak limit at the resulting
+    // target for neither file to be limited.
+    write_sine_wav(&dir.path().join("quiet.wav"), 0.03);
+    write_sine_wav(&dir.path().join("loud.wav"), 0.1);
+    let out_dir = tempfile::tempdir().unwrap();
+    let report_path = dir.path().join("sub").join("report.json");
+
+    let options = NormalizationOptions {
+        input_dir: dir.path().to_path_buf(),
+        output_dir: Some(out_dir.path().to_path_buf()),
+        report: Some(report_path.clone()),
+        verify: true,
+        ..NormalizationOptions::default()
+    };
+    normalize_folder_loudness(&options).unwrap();
+
+    let report: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
+    let files = report["files"].as_array().unwrap();
+    assert_eq!(files.len(), 2);
+    let target = report["target_lufs"].as_f64().unwrap();
+    assert!(target.is_finite());
+    for file in files {
+        assert_eq!(file["skipped"].as_bool(), Some(false));
+        assert!(file["input_lufs"].as_f64().unwrap().is_finite());
+        assert!(file["gain_db"].as_f64().unwrap().is_finite());
+        assert!(!file["peak_limited"].as_bool().unwrap());
+        // Verification re-measured every written file.
+        let output_lufs = file["output_lufs"].as_f64().unwrap();
+        assert!(
+            (output_lufs - target).abs() < 0.5,
+            "WAV output off target: {output_lufs} vs {target}"
+        );
+        assert!(file["output_true_peak_db"].as_f64().unwrap() <= -1.0);
+    }
+}
+
+#[test]
+fn measure_only_report_marks_skipped_files() {
+    let dir = tempfile::tempdir().unwrap();
+    write_sine_wav(&dir.path().join("sine.wav"), 0.3);
+    write_sine_wav(&dir.path().join("silent.wav"), 0.0);
+    let report_path = dir.path().join("report.csv");
+
+    let options = NormalizationOptions {
+        input_dir: dir.path().to_path_buf(),
+        report: Some(report_path.clone()),
+        measure_only: true,
+        ..NormalizationOptions::default()
+    };
+    normalize_folder_loudness(&options).unwrap();
+
+    let content = std::fs::read_to_string(&report_path).unwrap();
+    let mut lines = content.lines();
+    assert_eq!(
+        lines.next(),
+        Some(
+            "file,input_lufs,input_true_peak_db,gain_db,peak_limited,skipped,output_lufs,\
+             output_true_peak_db"
+        )
+    );
+    let rows: Vec<Vec<&str>> = lines.map(|line| line.split(',').collect()).collect();
+    assert_eq!(rows.len(), 2);
+    let sine = rows.iter().find(|row| row[0] == "sine.wav").unwrap();
+    let silent = rows.iter().find(|row| row[0] == "silent.wav").unwrap();
+    assert_eq!(sine[5], "false");
+    assert_ne!(sine[1], "");
+    assert_ne!(sine[3], "");
+    assert_eq!(silent[5], "true");
+    assert_eq!(silent[1], "");
+    assert_eq!(silent[3], "");
+}
+
+#[test]
+fn verify_conflicts_with_measure_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = NormalizationOptions {
+        input_dir: dir.path().to_path_buf(),
+        measure_only: true,
+        verify: true,
+        ..NormalizationOptions::default()
+    };
+    assert!(normalize_folder_loudness(&options).is_err());
+}
+
+#[test]
+fn report_rejects_unknown_extension() {
+    let dir = tempfile::tempdir().unwrap();
+    write_sine_wav(&dir.path().join("sine.wav"), 0.3);
+    let options = NormalizationOptions {
+        input_dir: dir.path().to_path_buf(),
+        report: Some(dir.path().join("report.txt")),
+        ..NormalizationOptions::default()
+    };
+    assert!(normalize_folder_loudness(&options).is_err());
 }

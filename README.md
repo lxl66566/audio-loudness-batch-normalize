@@ -39,6 +39,8 @@ Options:
     --true-peak-db <float>            Target true peak (dBTP) (default: -1.5)
     --wav-bit-depth <format>          WAV output sample format: auto, s16, s24, s32, f32 (default: auto)
     --ogg-quality <float>             Ogg Vorbis perceptual quality (default: 5.0, scale 0.0 to 10.0)
+    --report <path>                   Write a per-file measurement report; the format is selected by the path extension (.csv or .json)
+    --verify                          Re-measure written files and record the deviations in the report
 -t, --threads <number>                Number of processing threads (default: CPU core count)
 -n, --measure-only                    Only measure and report the target loudness (LUFS) without writing files
 ```
@@ -48,6 +50,7 @@ Options:
 - Currently, only WAV and OGG encoders are supported. If the input format is not OGG, the output will be in WAV format, and the original file will be preserved as is. If you need the equalized audio to retain its original format, you must convert it manually.
 - The WAV output sample format defaults to matching lossless integer sources (8/16-bit becomes 16-bit, 24-bit stays 24-bit, 32-bit stays 32-bit); float and lossy sources produce 32-bit float. Override with `--wav-bit-depth`.
 - Ogg Vorbis output is encoded at perceptual quality 5 by default; adjust with `--ogg-quality`.
+- Use `--report` with a `.csv` or `.json` path to get per-file measurements (input loudness, applied gain, peak limiting), and `--verify` to additionally re-measure every written file and record the deviation from the target.
 - Audio metadata (tags) is not preserved during format conversion.
 
 ## Theory

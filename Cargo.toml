@@ -1,6 +1,6 @@
 [package]
 name        = "audio-loudness-batch-normalize"
-version     = "0.3.3"
+version     = "0.4.0"
 edition     = "2024"
 description = "Easy to use audio loudness batch normalization tool using EBU R128 and RMS"
 readme      = "README.md"
@@ -26,6 +26,7 @@ log          = "0.4"
 pathdiff     = "0.2"
 rand         = "0.10"
 rayon        = "1.12"
+serde_json   = "1"
 spdlog-rs    = { version = "0.5", features = ["flexible-string", "log"], optional = true }
 strum        = "0.28"
 strum_macros = "0.28"
