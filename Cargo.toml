@@ -24,6 +24,7 @@ rand              = "0.10"
 rayon             = "1.12"
 strum_macros      = "0.28"
 symphonia         = { version = "0.6", features = ["all-codecs", "all-formats"] }
+tempfile          = "3"
 thiserror         = "2.0"
 vorbis_rs         = "0.5"
 walkdir           = "2"

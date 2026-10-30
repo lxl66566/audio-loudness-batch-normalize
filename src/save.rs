@@ -1,289 +1,167 @@
-use std::{fs::File, num::NonZero, path::Path};
+use std::{num::NonZero, path::Path};
 
-use log::warn;
-use symphonia::core::errors::Error as SymphoniaError;
+use tempfile::NamedTempFile;
 use vorbis_rs::VorbisEncoderBuilder;
 
 use crate::{
-    convert_buffer_to_planar_f32,
-    error::{Error, WritingError},
+    decode::DecodedAudio,
+    error::{DecodeError, Error, ProcessingError, WritingError},
 };
 
-/// Decodes packets, applies gain, and writes the result to a WAV file in a
-/// streaming fashion, without buffering the whole file in memory.
-///
-/// Must not be used when `output_path` is the file being decoded: creating
-/// the writer would truncate the input. Use [`collect_and_save_wav`] for
-/// in-place overwrites.
-pub fn stream_to_wav_writer(
-    format: &mut dyn symphonia::core::formats::FormatReader,
-    decoder: &mut dyn symphonia::core::codecs::audio::AudioDecoder,
-    track_id: u32,
-    final_linear_gain: f64,
-    output_path: &Path,
-    sample_rate: u32,
-    channels: u16,
-) -> Result<(), Error> {
-    let mut writer = hound::WavWriter::create(output_path, wav_spec(sample_rate, channels))
-        .map_err(|e| Error::Writing {
-            path: output_path.to_path_buf(),
-            source: WritingError::Wav(e),
-        })?;
-
-    loop {
-        match format.next_packet() {
-            Ok(Some(packet)) => {
-                if packet.track_id != track_id {
-                    continue;
-                }
-                match decoder.decode(&packet) {
-                    Ok(decoded) => {
-                        let planar = convert_buffer_to_planar_f32(&decoded).map_err(|e| {
-                            Error::Processing {
-                                path: output_path.to_path_buf(),
-                                source: e,
-                            }
-                        })?;
-
-                        if planar.is_empty() || planar[0].is_empty() {
-                            continue;
-                        }
-
-                        for frame_idx in 0..planar[0].len() {
-                            for channel in &planar {
-                                writer
-                                    .write_sample(channel[frame_idx] * final_linear_gain as f32)
-                                    .map_err(|e| Error::Writing {
-                                        path: output_path.to_path_buf(),
-                                        source: WritingError::Wav(e),
-                                    })?;
-                            }
-                        }
-                    }
-                    Err(SymphoniaError::DecodeError(e)) => {
-                        warn!("Decode error during WAV writing: {e}")
-                    }
-                    Err(e) => {
-                        return Err(Error::Processing {
-                            path: output_path.to_path_buf(),
-                            source: e.into(),
-                        });
-                    }
-                }
-            }
-            Ok(None) => break,
-            Err(SymphoniaError::IoError(ref e))
-                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-            {
-                break;
-            }
-            Err(e) => {
-                return Err(Error::Processing {
-                    path: output_path.to_path_buf(),
-                    source: e.into(),
-                });
-            }
-        }
-    }
-
-    writer.finalize().map_err(|e| Error::Writing {
-        path: output_path.to_path_buf(),
-        source: WritingError::Wav(e),
-    })
+/// Error while saving decoded audio: a decode failure on the input, or a
+/// write failure on the output.
+#[derive(thiserror::Error, Debug)]
+enum SaveError {
+    #[error(transparent)]
+    Decode(#[from] DecodeError),
+    #[error(transparent)]
+    Write(#[from] WritingError),
 }
 
-/// Collects all processed samples and saves them to a WAV file.
+/// Decodes the remaining audio, applies the linear gain, and writes the
+/// result as a 32-bit float WAV file.
 ///
-/// Required for in-place overwrites, where the input file must be fully
-/// decoded before the output file may be created.
-pub fn collect_and_save_wav(
-    format: &mut dyn symphonia::core::formats::FormatReader,
-    decoder: &mut dyn symphonia::core::codecs::audio::AudioDecoder,
-    track_id: u32,
-    final_linear_gain: f64,
+/// The output is written to a temporary file in the output directory and
+/// atomically renamed over `output_path` on success, so a failure (or an
+/// in-place overwrite) never truncates an existing file before the new
+/// content is complete.
+pub fn save_wav(
+    audio: &mut DecodedAudio,
+    input_path: &Path,
     output_path: &Path,
-    sample_rate: u32,
-    channels: u16,
+    final_linear_gain: f64,
 ) -> Result<(), Error> {
-    // First, collect all the processed samples into a buffer.
-    let samples =
-        collect_gained_samples(format, decoder, track_id, final_linear_gain, output_path)?;
-
-    // Write the collected samples to the WAV file in one go.
-    save_as_wav(output_path, wav_spec(sample_rate, channels), &samples).map_err(|e| {
-        Error::Writing {
-            path: output_path.to_path_buf(),
-            source: e,
-        }
-    })
-}
-
-fn wav_spec(sample_rate: u32, channels: u16) -> hound::WavSpec {
-    hound::WavSpec {
-        channels,
-        sample_rate,
+    let temp = create_temp_file(output_path)?;
+    let spec = hound::WavSpec {
+        channels: audio.channels,
+        sample_rate: audio.sample_rate,
         bits_per_sample: 32,
         sample_format: hound::SampleFormat::Float,
-    }
+    };
+    let file = temp
+        .reopen()
+        .map_err(|e| write_error(output_path, e.into()))?;
+    let mut writer =
+        hound::WavWriter::new(file, spec).map_err(|e| write_error(output_path, e.into()))?;
+
+    audio
+        .for_each_packet(|planar| {
+            for frame_idx in 0..planar[0].len() {
+                for channel in planar {
+                    writer
+                        .write_sample(channel[frame_idx] * final_linear_gain as f32)
+                        .map_err(|e| SaveError::Write(e.into()))?;
+                }
+            }
+            Ok(())
+        })
+        .map_err(|e| map_save_error(e, input_path, output_path))?;
+
+    writer
+        .finalize()
+        .map_err(|e| write_error(output_path, e.into()))?;
+    persist(temp, output_path)
 }
 
-/// Saves audio data as a WAV file.
+/// Decodes the remaining audio, applies the linear gain, and writes the
+/// result as an Ogg Vorbis file, encoding each decoded packet as it arrives.
 ///
-/// # Arguments
-/// * `path` - Output file path
-/// * `spec` - The WAV specification (channels, sample rate, etc.)
-/// * `samples` - Interleaved audio samples in 32-bit float format
-///
-/// # Returns
-/// Result indicating success or a WritingError
-pub fn save_as_wav(path: &Path, spec: hound::WavSpec, samples: &[f32]) -> Result<(), WritingError> {
-    let mut writer = hound::WavWriter::create(path, spec).map_err(WritingError::Wav)?;
-    for &sample in samples {
-        writer.write_sample(sample).map_err(WritingError::Wav)?;
-    }
-    writer.finalize().map_err(WritingError::Wav)
-}
-
-pub fn stream_to_ogg_writer(
-    format: &mut dyn symphonia::core::formats::FormatReader,
-    decoder: &mut dyn symphonia::core::codecs::audio::AudioDecoder,
-    track_id: u32,
-    final_linear_gain: f64,
+/// The output is written to a temporary file in the output directory and
+/// atomically renamed over `output_path` on success, so a failure (or an
+/// in-place overwrite) never truncates an existing file before the new
+/// content is complete.
+pub fn save_ogg(
+    audio: &mut DecodedAudio,
+    input_path: &Path,
     output_path: &Path,
-    sample_rate: u32,
-    channels: u16,
+    final_linear_gain: f64,
 ) -> Result<(), Error> {
-    // OGG saving still requires collecting all samples due to vorbis-rs API.
-    let samples =
-        collect_gained_samples(format, decoder, track_id, final_linear_gain, output_path)?;
-    save_as_ogg(output_path, channels as usize, sample_rate, &samples).map_err(|e| {
-        Error::Writing {
+    let sample_rate = NonZero::new(audio.sample_rate).ok_or_else(|| {
+        write_error(
+            output_path,
+            WritingError::InvalidParams("sample rate is zero"),
+        )
+    })?;
+    let channels = u8::try_from(audio.channels)
+        .ok()
+        .and_then(NonZero::new)
+        .ok_or_else(|| {
+            write_error(
+                output_path,
+                WritingError::InvalidParams("channels must be in 1..=255"),
+            )
+        })?;
+
+    let temp = create_temp_file(output_path)?;
+    let file = temp
+        .reopen()
+        .map_err(|e| write_error(output_path, e.into()))?;
+    let mut encoder = VorbisEncoderBuilder::new(sample_rate, channels, file)
+        .and_then(|mut builder| builder.build())
+        .map_err(|e| write_error(output_path, e.into()))?;
+
+    audio
+        .for_each_packet(|planar| {
+            let gained: Vec<Vec<f32>> = planar
+                .iter()
+                .map(|channel| {
+                    channel
+                        .iter()
+                        .map(|&sample| sample * final_linear_gain as f32)
+                        .collect()
+                })
+                .collect();
+            encoder
+                .encode_audio_block(&gained)
+                .map_err(|e| SaveError::Write(e.into()))
+        })
+        .map_err(|e| map_save_error(e, input_path, output_path))?;
+
+    // finish writes the pending blocks and returns the sink; close it before
+    // the rename.
+    drop(
+        encoder
+            .finish()
+            .map_err(|e| write_error(output_path, e.into()))?,
+    );
+    persist(temp, output_path)
+}
+
+/// Creates a temporary file in the directory of `output_path`.
+fn create_temp_file(output_path: &Path) -> Result<NamedTempFile, Error> {
+    let parent = output_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    NamedTempFile::new_in(parent).map_err(|e| write_error(output_path, e.into()))
+}
+
+/// Atomically renames the temporary file over `output_path`.
+fn persist(temp: NamedTempFile, output_path: &Path) -> Result<(), Error> {
+    // persist returns the (still open) file handle; close it explicitly.
+    let file = temp
+        .persist(output_path)
+        .map_err(|e| write_error(output_path, e.error.into()))?;
+    drop(file);
+    Ok(())
+}
+
+fn write_error(path: &Path, source: WritingError) -> Error {
+    Error::Writing {
+        path: path.to_path_buf(),
+        source,
+    }
+}
+
+fn map_save_error(e: SaveError, input_path: &Path, output_path: &Path) -> Error {
+    match e {
+        SaveError::Decode(e) => Error::Processing {
+            path: input_path.to_path_buf(),
+            source: ProcessingError::Decode(e),
+        },
+        SaveError::Write(e) => Error::Writing {
             path: output_path.to_path_buf(),
             source: e,
-        }
-    })?;
-    Ok(())
-}
-
-/// Saves audio data as an Ogg Vorbis file
-///
-/// # Arguments
-/// * `path` - Output file path
-/// * `channels` - Number of audio channels
-/// * `sample_rate` - Sample rate in Hz
-/// * `samples` - Interleaved audio samples in 32-bit float format
-///
-/// # Returns
-/// Result indicating success or a WritingError
-///
-/// # Panics
-/// Panics if the number of channels is zero
-pub fn save_as_ogg(
-    path: &Path,
-    channels: usize,
-    sample_rate: u32,
-    samples: &[f32],
-) -> Result<(), WritingError> {
-    assert!(channels > 0, "channels could not be zero");
-    // Open the output file
-    let output_file = File::create(path)?;
-
-    // Initialize the Vorbis encoder
-    let mut encoder = VorbisEncoderBuilder::new(
-        NonZero::new(sample_rate).unwrap(),
-        NonZero::new(channels as u8).unwrap(),
-        output_file,
-    )?
-    .build()?;
-
-    // Flush the encoder roughly every second of audio to bound memory usage.
-    let block_frames = sample_rate as usize;
-
-    // Convert interleaved samples to planar format
-    let mut planar_samples: Vec<Vec<f32>> = vec![Vec::with_capacity(block_frames); channels];
-    for frame in samples.chunks_exact(channels) {
-        for (channel, &sample) in frame.iter().enumerate() {
-            planar_samples[channel].push(sample);
-        }
-        if planar_samples[0].len() >= block_frames {
-            encoder.encode_audio_block(&planar_samples)?;
-            for channel_samples in &mut planar_samples {
-                channel_samples.clear();
-            }
-        }
+        },
     }
-    if !planar_samples[0].is_empty() {
-        encoder.encode_audio_block(&planar_samples)?;
-    }
-    encoder.finish()?;
-    Ok(())
-}
-
-/// Helper for `decode_apply_gain_and_save`: collects all processed samples into
-/// a Vec. Used for formats that don't support streaming writes with the current
-/// libraries (e.g., Ogg).
-fn collect_gained_samples(
-    format: &mut dyn symphonia::core::formats::FormatReader,
-    decoder: &mut dyn symphonia::core::codecs::audio::AudioDecoder,
-    track_id: u32,
-    final_linear_gain: f64,
-    output_path: &Path, // for error context
-) -> Result<Vec<f32>, Error> {
-    let mut all_samples_interleaved = Vec::new();
-    loop {
-        match format.next_packet() {
-            Ok(Some(packet)) => {
-                if packet.track_id != track_id {
-                    continue;
-                }
-                match decoder.decode(&packet) {
-                    Ok(decoded) => {
-                        let planar = convert_buffer_to_planar_f32(&decoded).map_err(|e| {
-                            Error::Processing {
-                                path: output_path.to_path_buf(),
-                                source: e,
-                            }
-                        })?;
-
-                        if planar.is_empty() || planar[0].is_empty() {
-                            continue;
-                        }
-
-                        let num_frames = planar[0].len();
-                        let num_channels = planar.len();
-
-                        for frame_idx in 0..num_frames {
-                            for channel_idx in 0..num_channels {
-                                let sample = planar[channel_idx][frame_idx];
-                                let processed_sample = sample * final_linear_gain as f32;
-                                all_samples_interleaved.push(processed_sample);
-                            }
-                        }
-                    }
-                    Err(SymphoniaError::DecodeError(e)) => {
-                        warn!("Decode error during sample collection: {e}")
-                    }
-                    Err(e) => {
-                        return Err(Error::Processing {
-                            path: output_path.to_path_buf(),
-                            source: e.into(),
-                        });
-                    }
-                }
-            }
-            Ok(None) => break,
-            Err(SymphoniaError::IoError(ref e))
-                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-            {
-                break;
-            }
-            Err(e) => {
-                return Err(Error::Processing {
-                    path: output_path.to_path_buf(),
-                    source: e.into(),
-                });
-            }
-        }
-    }
-    Ok(all_samples_interleaved)
 }

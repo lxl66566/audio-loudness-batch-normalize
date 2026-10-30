@@ -2,6 +2,23 @@ use std::path::PathBuf;
 
 use symphonia::core::errors::Error as SymphoniaError;
 
+/// Errors raised while opening an audio file or decoding its packets.
+#[derive(thiserror::Error, Debug)]
+pub enum DecodeError {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("Symphonia error: {0}")]
+    Symphonia(#[from] SymphoniaError),
+    #[error("No compatible audio track found in {0:?}")]
+    NoTrack(PathBuf),
+    #[error("Missing sample rate")]
+    MissingSampleRate,
+    #[error("Missing channel specification")]
+    MissingChannelSpec,
+    #[error("Unsupported audio buffer format")]
+    UnsupportedBufferFormat,
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum MeasurementError {
     #[error("Symphonia error: {0}")]
@@ -26,19 +43,15 @@ pub enum WritingError {
     Ogg(#[from] vorbis_rs::VorbisError),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("Invalid parameters: {0}")]
+    InvalidParams(&'static str),
 }
 
 #[derive(thiserror::Error, Debug)]
 pub enum ProcessingError {
-    #[error("Symphonia error: {0}")]
-    Symphonia(#[from] SymphoniaError),
-    #[error("No compatible audio track found in {0:?}")]
-    NoTrack(PathBuf),
-    #[error("Missing sample rate")]
-    MissingSampleRate,
-    #[error("Missing channel specification")]
-    MissingChannelSpec,
-    #[error("Unsupported audio buffer format")]
+    #[error("Decode error: {0}")]
+    Decode(#[from] DecodeError),
+    #[error("Unsupported audio format")]
     UnsupportedFormat,
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -46,8 +59,6 @@ pub enum ProcessingError {
     FilesFailed(usize),
     #[error("Target loudness calculation failed: {0}")]
     TargetLoudnessCalculationFailed(String),
-    #[error("EBU R128 error: {0}")]
-    EbuR128(#[from] ebur128::Error),
 }
 
 #[derive(thiserror::Error, Debug)]

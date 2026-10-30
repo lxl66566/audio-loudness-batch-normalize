@@ -1,5 +1,7 @@
 #![allow(clippy::needless_range_loop)]
 
+/// Module for opening and decoding audio files
+pub mod decode;
 /// Module for error handling
 pub mod error;
 /// Module for saving audio files
@@ -18,7 +20,7 @@ use rand::seq::IndexedRandom as _;
 use rayon::prelude::*;
 use strum_macros::Display;
 use symphonia::core::{
-    audio::{Audio, Channels, GenericAudioBufferRef},
+    audio::Channels,
     errors::Error as SymphoniaError,
     formats::{TrackType, probe::Hint},
     io::MediaSourceStream,
@@ -27,7 +29,7 @@ use walkdir::WalkDir;
 
 use crate::{
     error::{Error, MeasurementError, ProcessingError},
-    save::{collect_and_save_wav, stream_to_ogg_writer, stream_to_wav_writer},
+    save::{save_ogg, save_wav},
 };
 
 /// Represents supported audio file formats
@@ -400,102 +402,25 @@ pub fn process_single_file(
 }
 
 /// Decodes the audio file again, applies the final calculated gain, and saves
-/// the result in a streaming fashion to minimize memory usage.
+/// the result. The output is written to a temporary file first and atomically
+/// renamed into place, so even an in-place overwrite never truncates the input
+/// before the new content is complete.
 fn decode_apply_gain_and_save(
     input_path: &Path,
     output_path: &Path,
     file_format: &AudioFormats,
     final_linear_gain: f64,
 ) -> Result<(), Error> {
-    let file = fs::File::open(input_path).map_err(|e| Error::Io {
+    let mut audio = decode::open(input_path).map_err(|e| Error::Processing {
         path: input_path.to_path_buf(),
-        source: e,
+        source: e.into(),
     })?;
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
-    let mut format = symphonia::default::get_probe()
-        .probe(&Hint::new(), mss, Default::default(), Default::default())
-        .map_err(|e| Error::Processing {
-            path: input_path.to_path_buf(),
-            source: e.into(),
-        })?;
 
-    let track = format
-        .default_track(TrackType::Audio)
-        .ok_or_else(|| Error::Processing {
-            path: input_path.to_path_buf(),
-            source: ProcessingError::NoTrack(input_path.to_path_buf()),
-        })?;
-
-    let track_id = track.id;
-    let audio_params = track
-        .codec_params
-        .as_ref()
-        .and_then(symphonia::core::codecs::CodecParameters::audio)
-        .ok_or_else(|| Error::Processing {
-            path: input_path.to_path_buf(),
-            source: ProcessingError::NoTrack(input_path.to_path_buf()),
-        })?;
-    let sample_rate = audio_params.sample_rate.ok_or_else(|| Error::Processing {
-        path: input_path.to_path_buf(),
-        source: ProcessingError::MissingSampleRate,
-    })?;
-    let channels = audio_params
-        .channels
-        .as_ref()
-        .map(|c| c.count() as u16)
-        .ok_or_else(|| Error::Processing {
-            path: input_path.to_path_buf(),
-            source: ProcessingError::MissingChannelSpec,
-        })?;
-    let mut decoder = symphonia::default::get_codecs()
-        .make_audio_decoder(audio_params, &Default::default())
-        .map_err(|e| Error::Processing {
-            path: input_path.to_path_buf(),
-            source: e.into(),
-        })?;
-
-    // --- Set up the writer based on format ---
     match file_format {
-        AudioFormats::Ogg => {
-            stream_to_ogg_writer(
-                &mut *format,
-                &mut *decoder,
-                track_id,
-                final_linear_gain,
-                output_path,
-                sample_rate,
-                channels,
-            )?;
-        }
+        AudioFormats::Ogg => save_ogg(&mut audio, input_path, output_path, final_linear_gain),
         // All other formats are saved as WAV.
-        _ => {
-            if output_path == input_path {
-                // In-place overwrite: decode everything before truncating the
-                // input file.
-                collect_and_save_wav(
-                    &mut *format,
-                    &mut *decoder,
-                    track_id,
-                    final_linear_gain,
-                    output_path,
-                    sample_rate,
-                    channels,
-                )?;
-            } else {
-                stream_to_wav_writer(
-                    &mut *format,
-                    &mut *decoder,
-                    track_id,
-                    final_linear_gain,
-                    output_path,
-                    sample_rate,
-                    channels,
-                )?;
-            }
-        }
+        _ => save_wav(&mut audio, input_path, output_path, final_linear_gain),
     }
-
-    Ok(())
 }
 
 /// Measures the loudness and true peak of a single audio file in one decode
@@ -545,7 +470,7 @@ pub fn measure_single_file_stats(path: impl AsRef<Path>) -> Result<AudioStats, M
                     continue;
                 }
                 match decoder.decode(&packet) {
-                    Ok(decoded) => match convert_buffer_to_planar_f32(&decoded) {
+                    Ok(decoded) => match decode::convert_buffer_to_planar_f32(&decoded) {
                         Ok(planar_f32) => {
                             let plane_slices: Vec<&[f32]> =
                                 planar_f32.iter().map(|v| v.as_slice()).collect();
@@ -677,72 +602,6 @@ fn calculate_target_loudness(
         )));
     }
     Ok(mean)
-}
-
-fn convert_buffer_to_planar_f32(
-    decoded: &GenericAudioBufferRef<'_>,
-) -> Result<Vec<Vec<f32>>, ProcessingError> {
-    let num_channels = decoded.spec().channels().count();
-    let mut planar_output: Vec<Vec<f32>> = Vec::with_capacity(num_channels);
-
-    match decoded {
-        GenericAudioBufferRef::F32(buf) => {
-            for plane in buf.iter_planes() {
-                planar_output.push(plane.to_vec());
-            }
-        }
-        GenericAudioBufferRef::F64(buf) => {
-            for plane in buf.iter_planes() {
-                planar_output.push(plane.iter().map(|&s| s as f32).collect());
-            }
-        }
-        GenericAudioBufferRef::S32(buf) => {
-            for plane in buf.iter_planes() {
-                planar_output.push(
-                    plane
-                        .iter()
-                        .map(|&s| (s as f32) / (i32::MAX as f32))
-                        .collect(),
-                );
-            }
-        }
-        GenericAudioBufferRef::S24(buf) => {
-            for plane in buf.iter_planes() {
-                let max_value = 8388607.0; // 2^23 - 1
-                planar_output.push(
-                    plane
-                        .iter()
-                        .map(|&s| s.inner() as f32 / max_value)
-                        .collect(),
-                );
-            }
-        }
-        GenericAudioBufferRef::S16(buf) => {
-            for plane in buf.iter_planes() {
-                // 将有符号16位整数规范化到[-1.0, 1.0]范围
-                planar_output.push(
-                    plane
-                        .iter()
-                        .map(|&s| (s as f32) / (i16::MAX as f32))
-                        .collect(),
-                );
-            }
-        }
-        GenericAudioBufferRef::U8(buf) => {
-            for plane in buf.iter_planes() {
-                // 将无符号8位整数规范化到[-1.0, 1.0]范围
-                // u8范围是[0, 255]，需要先转换到[-128, 127]
-                planar_output.push(
-                    plane
-                        .iter()
-                        .map(|&s| ((s as i16 - 128) as f32) / 128.0)
-                        .collect(),
-                );
-            }
-        }
-        _ => return Err(ProcessingError::UnsupportedFormat),
-    }
-    Ok(planar_output)
 }
 
 /// Validates normalization options for correctness
