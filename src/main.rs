@@ -30,6 +30,8 @@ fn main() -> Result<()> {
         info!("  Target Loudness: Automatic (calculated)");
     }
     info!("  Target True Peak: {:.1} dBTP", options.true_peak_db);
+    info!("  WAV Bit Depth: {:?}", options.wav_bit_depth);
+    info!("  OGG Quality: {}", options.ogg_quality);
     if let Some(n) = options.num_threads {
         info!("  Threads: {n}");
     } else {

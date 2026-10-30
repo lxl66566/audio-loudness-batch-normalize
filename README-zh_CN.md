@@ -34,9 +34,11 @@ loudness-normalize <输入目录> [选项]
 <输入目录>                       输入音频文件目录
 -o, --output <路径>              输出目录（默认：直接修改输入音频文件）
 -s, --sample-percentage <浮点数> 采样文件的百分比（默认：1.00，将采样所有音频文件）
--t, --trim-percentage <浮点数>   计算平均时的截尾百分比（默认：0.30，会截掉最高 15% 和最低 15% 的部分）
+    --trim-percentage <浮点数>   计算平均时的截尾百分比（默认：0.30，会截掉最高 15% 和最低 15% 的部分）
     --target-lufs <浮点数>       目标响度值（LUFS）（默认：自动计算）
     --true-peak-db <浮点数>      目标真峰值（dBTP）（默认：-1.5）
+    --wav-bit-depth <格式>       WAV 输出采样格式：auto、s16、s24、s32、f32（默认：auto）
+    --ogg-quality <浮点数>       Ogg Vorbis 感知质量（默认：5.0，范围 0.0 到 10.0）
 -t, --threads <数字>             处理线程数（默认：CPU核心数）
 -n, --measure-only               仅测量并计算目标响度（LUFS），不执行响度变更
 ```
@@ -44,6 +46,8 @@ loudness-normalize <输入目录> [选项]
 ## Tip
 
 - 当前仅支持 WAV、OGG 的编码器，如果输入格式不是 OGG 格式，输出将会是 WAV 格式，原文件将被原样保留。如果你需要让均衡后的音频保持原先的格式，需要手动转换。
+- WAV 输出采样格式默认跟随无损整型源（8/16-bit 输出 16-bit，24-bit 保持 24-bit，32-bit 保持 32-bit）；浮点源和有损源输出 32-bit float。可用 `--wav-bit-depth` 覆盖。
+- Ogg Vorbis 输出默认使用感知质量 5 编码，可用 `--ogg-quality` 调整。
 - 格式转换时音频元数据（tags）不会被保留。
 
 ## Theory

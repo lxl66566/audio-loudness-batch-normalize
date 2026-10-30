@@ -30,6 +30,7 @@ use strum_macros::{Display, EnumIter};
 use walkdir::WalkDir;
 
 use crate::{
+    decode::SourceSampleFormat,
     error::{Error, MeasurementError, ProcessingError},
     save::{save_ogg, save_wav},
 };
@@ -55,6 +56,39 @@ impl AudioFormat {
     pub fn from_path(value: impl AsRef<Path>) -> Option<Self> {
         let ext = value.as_ref().extension()?.to_string_lossy().to_lowercase();
         Self::iter().find(|format| format.to_string() == ext)
+    }
+}
+
+/// Sample format for WAV output files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "bin", derive(clap::ValueEnum))]
+pub enum WavBitDepth {
+    /// Match the source when it is lossless integer audio (8/16-bit sources
+    /// become 16-bit); float and lossy sources produce 32-bit float.
+    #[default]
+    Auto,
+    /// 16-bit signed integer PCM.
+    S16,
+    /// 24-bit signed integer PCM.
+    S24,
+    /// 32-bit signed integer PCM.
+    S32,
+    /// 32-bit float.
+    F32,
+}
+
+impl WavBitDepth {
+    /// Resolves `Auto` against the source sample format; the result is a
+    /// concrete format.
+    #[must_use]
+    pub fn resolve(self, source: SourceSampleFormat) -> Self {
+        match (self, source) {
+            (Self::Auto, SourceSampleFormat::Int8 | SourceSampleFormat::Int16) => Self::S16,
+            (Self::Auto, SourceSampleFormat::Int24) => Self::S24,
+            (Self::Auto, SourceSampleFormat::Int32) => Self::S32,
+            (Self::Auto, SourceSampleFormat::Float | SourceSampleFormat::Unknown) => Self::F32,
+            (concrete, _) => concrete,
+        }
     }
 }
 
@@ -100,15 +134,39 @@ pub struct NormalizationOptions {
     /// normalized files
     #[cfg_attr(feature = "bin", arg(short = 'n', long))]
     pub measure_only: bool,
+    /// sample format for WAV output files, default to matching lossless
+    /// integer sources
+    #[cfg_attr(
+        feature = "bin",
+        arg(long, value_enum, default_value_t = Self::DEFAULT_WAV_BIT_DEPTH)
+    )]
+    pub wav_bit_depth: WavBitDepth,
+    /// Ogg Vorbis perceptual quality (0.0 to 10.0)
+    #[cfg_attr(
+        feature = "bin",
+        arg(long, default_value_t = Self::DEFAULT_OGG_QUALITY)
+    )]
+    pub ogg_quality: f64,
+    /// write a per-file measurement report; the format is selected by the
+    /// path extension (.csv or .json)
+    #[cfg_attr(feature = "bin", arg(long))]
+    pub report: Option<PathBuf>,
+    /// re-measure written files and record the deviations in the report
+    #[cfg_attr(feature = "bin", arg(long))]
+    pub verify: bool,
 }
 
 impl NormalizationOptions {
+    /// Default Ogg Vorbis quality on the 0-10 scale.
+    pub const DEFAULT_OGG_QUALITY: f64 = 5.0;
     /// Default percentage of files to sample for target loudness calculation.
     pub const DEFAULT_SAMPLE_PERCENTAGE: f64 = 1.0;
     /// Default percentage of measurements to trim from each end.
     pub const DEFAULT_TRIM_PERCENTAGE: f64 = 0.3;
     /// Default target true peak in dBTP.
     pub const DEFAULT_TRUE_PEAK_DB: f64 = -1.5;
+    /// Default WAV output sample format.
+    pub const DEFAULT_WAV_BIT_DEPTH: WavBitDepth = WavBitDepth::Auto;
 }
 
 impl Default for NormalizationOptions {
@@ -122,6 +180,10 @@ impl Default for NormalizationOptions {
             true_peak_db: Self::DEFAULT_TRUE_PEAK_DB,
             num_threads: None,
             measure_only: false,
+            wav_bit_depth: Self::DEFAULT_WAV_BIT_DEPTH,
+            ogg_quality: Self::DEFAULT_OGG_QUALITY,
+            report: None,
+            verify: false,
         }
     }
 }
@@ -133,6 +195,31 @@ pub struct AudioStats {
     pub loudness_lufs: f64,
     /// True peak in dBTP
     pub true_peak_db: f64,
+}
+
+/// Outcome of processing a single file.
+#[derive(Debug, Clone)]
+pub struct ProcessedFile {
+    /// Input file path.
+    pub path: PathBuf,
+    /// Path of the file written by this run; `None` when the file was
+    /// skipped (silent or unmeasurable input).
+    pub output_path: Option<PathBuf>,
+    /// Measured statistics of the input; `None` when skipped.
+    pub stats: Option<AudioStats>,
+    /// Final applied gain in dB (0.0 when skipped).
+    pub gain_db: f64,
+    /// Whether true-peak limiting reduced the gain below the loudness gain.
+    pub peak_limited: bool,
+}
+
+/// Per-file encoding settings.
+#[derive(Debug, Clone, Copy)]
+pub struct EncodeConfig {
+    /// Sample format for WAV output files.
+    pub wav_bit_depth: WavBitDepth,
+    /// Ogg Vorbis perceptual quality on the 0-10 scale.
+    pub ogg_quality: f64,
 }
 
 /// Shared progress bar style for the parallel stages.
@@ -204,29 +291,7 @@ pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<(), E
 
         // 4. Measure loudness of sampled files (in parallel)
         info!("Measuring loudness of sampled files...");
-        let sample_pb = ProgressBar::new(sampled_files.len() as u64);
-        sample_pb.set_style(progress_style());
-        sample_pb.set_message("Measuring samples");
-
-        let loudness_measurements: HashMap<PathBuf, Result<AudioStats, MeasurementError>> = pool
-            .install(|| {
-                sampled_files
-                    .par_iter()
-                    .progress_with(sample_pb.clone())
-                    .map(|path| {
-                        let loudness_result = measure_single_file_stats(path);
-                        if let Err(e) = &loudness_result {
-                            warn!(
-                                "Failed to measure loudness for sample {:?}: {}",
-                                path.file_name().unwrap_or_default(),
-                                e
-                            );
-                        }
-                        (path.to_path_buf(), loudness_result)
-                    })
-                    .collect()
-            });
-        sample_pb.finish_with_message("Sample measurement done");
+        let loudness_measurements = measure_sampled_files(&pool, &sampled_files);
 
         // 5. Calculate target loudness (trimmed mean)
         let calculated_target =
@@ -263,7 +328,11 @@ pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<(), E
     process_pb.set_style(progress_style());
     process_pb.set_message("Processing files");
 
-    let results: Vec<Result<(), Error>> = pool.install(|| {
+    let encode_config = EncodeConfig {
+        wav_bit_depth: options.wav_bit_depth,
+        ogg_quality: options.ogg_quality,
+    };
+    let results: Vec<Result<ProcessedFile, Error>> = pool.install(|| {
         all_audio_files
             .par_iter()
             .progress_with(process_pb.clone())
@@ -275,18 +344,19 @@ pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<(), E
                     &options.input_dir,
                     &options.output_dir,
                     &loudness_measurements_cache,
+                    &encode_config,
                 )
             })
             .collect()
     });
     process_pb.finish_with_message("Processing done");
 
-    // 7. Report final status and errors
-    let mut success_count = 0;
+    // 7. Collect outcomes and report final status
+    let mut processed: Vec<ProcessedFile> = Vec::with_capacity(results.len());
     let mut error_count = 0;
     for result in results {
         match result {
-            Ok(()) => success_count += 1,
+            Ok(processed_file) => processed.push(processed_file),
             Err(e) => {
                 error!("Error: {e}"); // Log the detailed error
                 error_count += 1;
@@ -294,7 +364,10 @@ pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<(), E
         }
     }
 
-    info!("Processing complete. {success_count} files succeeded, {error_count} files failed.");
+    info!(
+        "Processing complete. {} files succeeded, {error_count} files failed.",
+        processed.len()
+    );
 
     if error_count > 0 {
         Err(Error::Processing {
@@ -306,8 +379,46 @@ pub fn normalize_folder_loudness(options: &NormalizationOptions) -> Result<(), E
     }
 }
 
+/// Measures the given files in parallel, warning about failures.
+fn measure_sampled_files<I>(
+    pool: &rayon::ThreadPool,
+    files: I,
+) -> HashMap<PathBuf, Result<AudioStats, MeasurementError>>
+where
+    I: IntoParallelIterator,
+    I::Item: AsRef<Path>,
+    I::Iter: IndexedParallelIterator,
+{
+    let iter = files.into_par_iter();
+    let sample_pb = ProgressBar::new(iter.len() as u64);
+    sample_pb.set_style(progress_style());
+    sample_pb.set_message("Measuring samples");
+
+    let measurements: HashMap<PathBuf, Result<AudioStats, MeasurementError>> = pool.install(|| {
+        iter.progress_with(sample_pb.clone())
+            .map(|path| {
+                let path = path.as_ref();
+                let loudness_result = measure_single_file_stats(path);
+                if let Err(e) = &loudness_result {
+                    warn!(
+                        "Failed to measure loudness for sample {:?}: {}",
+                        path.file_name().unwrap_or_default(),
+                        e
+                    );
+                }
+                (path.to_path_buf(), loudness_result)
+            })
+            .collect()
+    });
+    sample_pb.finish_with_message("Sample measurement done");
+    measurements
+}
+
 /// Main orchestration function for processing a single file using the two-pass
-/// method.
+/// method: measurement (or reuse of the cached sampling measurement) followed
+/// by the gain pass.
+///
+/// Returns the outcome of the file for the run report.
 // The cache is built internally with the default hasher; generalizing it over
 // `BuildHasher` would leak a type parameter into every call site.
 #[allow(clippy::implicit_hasher)]
@@ -318,7 +429,8 @@ pub fn process_single_file(
     input_base_dir: impl AsRef<Path>,
     output_base_dir: &Option<impl AsRef<Path>>,
     cache: &Option<HashMap<PathBuf, Result<AudioStats, MeasurementError>>>,
-) -> Result<(), Error> {
+    encode: &EncodeConfig,
+) -> Result<ProcessedFile, Error> {
     let input_path = input_path.as_ref();
     let file_format = AudioFormat::from_path(input_path).ok_or_else(|| Error::Processing {
         path: input_path.to_path_buf(),
@@ -355,15 +467,22 @@ pub fn process_single_file(
             "non-finite loudness"
         };
         info!("Skipping processing for {reason}: {file_name_str}");
-        return Ok(());
+        return Ok(ProcessedFile {
+            path: input_path.to_path_buf(),
+            output_path: None,
+            stats: None,
+            gain_db: 0.0,
+            peak_limited: false,
+        });
     }
 
     // 2. Calculate the final, combined linear gain
-    let final_linear_gain = compute_gain(stats, target_lufs, target_peak_db);
+    let gain = compute_gain(stats, target_lufs, target_peak_db);
 
     debug!(
         "  -> File: {file_name_str}, Current LUFS: {current_lufs:.2}, Target LUFS: \
-         {target_lufs:.2}, Final Combined Linear Gain: {final_linear_gain:.3}x"
+         {target_lufs:.2}, Final Combined Linear Gain: {:.3}x",
+        gain.linear
     );
 
     // --- PROCESSING & SAVING ---
@@ -401,26 +520,48 @@ pub fn process_single_file(
     }
 
     // Decode, apply final gain, and save in a streaming manner
-    decode_apply_gain_and_save(input_path, &output_path, &file_format, final_linear_gain)?;
+    decode_apply_gain_and_save(input_path, &output_path, &file_format, gain.linear, encode)?;
 
     debug!(
         "Successfully wrote normalized file to {}",
         output_path.display()
     );
-    Ok(())
+    Ok(ProcessedFile {
+        path: input_path.to_path_buf(),
+        output_path: Some(output_path),
+        stats: Some(stats),
+        gain_db: gain.db,
+        peak_limited: gain.peak_limited,
+    })
 }
 
-/// Computes the combined linear gain that moves the loudness of `stats` to
+/// Combined gain decision for a single file.
+#[derive(Debug, Clone, Copy)]
+struct GainDecision {
+    /// Combined linear gain.
+    linear: f64,
+    /// Combined gain in dB.
+    db: f64,
+    /// Whether true-peak limiting reduced the gain below the loudness gain.
+    peak_limited: bool,
+}
+
+/// Computes the combined gain that moves the loudness of `stats` to
 /// `target_lufs`, additionally limited so the true peak after the gain does
 /// not exceed `target_peak_db`.
 ///
 /// The measurement is linear, so a constant gain shifts the true peak by the
 /// same dB amount.
-fn compute_gain(stats: AudioStats, target_lufs: f64, target_peak_db: f64) -> f64 {
+fn compute_gain(stats: AudioStats, target_lufs: f64, target_peak_db: f64) -> GainDecision {
     let loudness_gain_db = target_lufs - stats.loudness_lufs;
     let peak_after_gain_db = stats.true_peak_db + loudness_gain_db;
     let peak_limiting_gain_db = (target_peak_db - peak_after_gain_db).min(0.0);
-    10.0_f64.powf((loudness_gain_db + peak_limiting_gain_db) / 20.0)
+    let db = loudness_gain_db + peak_limiting_gain_db;
+    GainDecision {
+        linear: 10.0_f64.powf(db / 20.0),
+        db,
+        peak_limited: peak_limiting_gain_db < 0.0,
+    }
 }
 
 /// Decodes the audio file again, applies the final calculated gain, and saves
@@ -432,6 +573,7 @@ fn decode_apply_gain_and_save(
     output_path: &Path,
     file_format: &AudioFormat,
     final_linear_gain: f64,
+    encode: &EncodeConfig,
 ) -> Result<(), Error> {
     let audio = decode::open(input_path).map_err(|e| Error::Processing {
         path: input_path.to_path_buf(),
@@ -439,9 +581,21 @@ fn decode_apply_gain_and_save(
     })?;
 
     match file_format {
-        AudioFormat::Ogg => save_ogg(audio, input_path, output_path, final_linear_gain),
+        AudioFormat::Ogg => save_ogg(
+            audio,
+            input_path,
+            output_path,
+            final_linear_gain,
+            encode.ogg_quality,
+        ),
         // All other formats are saved as WAV.
-        _ => save_wav(audio, input_path, output_path, final_linear_gain),
+        _ => save_wav(
+            audio,
+            input_path,
+            output_path,
+            final_linear_gain,
+            encode.wav_bit_depth,
+        ),
     }
 }
 
@@ -604,6 +758,12 @@ fn validate_options(options: &NormalizationOptions) -> Result<(), Error> {
             options.trim_percentage
         )));
     }
+    if !(0.0..=10.0).contains(&options.ogg_quality) {
+        return Err(Error::InvalidOptions(format!(
+            "OGG quality must be between 0.0 and 10.0: {}",
+            options.ogg_quality
+        )));
+    }
     if options.true_peak_db > 0.0 {
         warn!(
             "Target true peak {:.1} dBTP is above 0 dBFS. This will likely cause clipping in \
@@ -700,7 +860,10 @@ mod tests {
         };
         // +6 dB loudness gain, peak after gain -6.0 dBTP < -1.5 dBTP: no
         // limiting.
-        assert!((compute_gain(stats, -14.0, -1.5) - 10.0_f64.powf(6.0 / 20.0)).abs() < 1e-12);
+        let gain = compute_gain(stats, -14.0, -1.5);
+        assert!((gain.linear - 10.0_f64.powf(6.0 / 20.0)).abs() < 1e-12);
+        assert!((gain.db - 6.0).abs() < 1e-9);
+        assert!(!gain.peak_limited);
     }
 
     #[test]
@@ -711,7 +874,34 @@ mod tests {
         };
         // +6 dB loudness gain would push the peak to +1.0 dBTP; limited to
         // -1.5 dBTP, so the combined gain is 6.0 - 2.5 = 3.5 dB.
-        assert!((compute_gain(stats, -14.0, -1.5) - 10.0_f64.powf(3.5 / 20.0)).abs() < 1e-12);
+        let gain = compute_gain(stats, -14.0, -1.5);
+        assert!((gain.linear - 10.0_f64.powf(3.5 / 20.0)).abs() < 1e-12);
+        assert!((gain.db - 3.5).abs() < 1e-9);
+        assert!(gain.peak_limited);
+    }
+
+    #[test]
+    fn wav_bit_depth_auto_matches_lossless_integer_sources() {
+        let cases = [
+            (SourceSampleFormat::Int8, WavBitDepth::S16),
+            (SourceSampleFormat::Int16, WavBitDepth::S16),
+            (SourceSampleFormat::Int24, WavBitDepth::S24),
+            (SourceSampleFormat::Int32, WavBitDepth::S32),
+            (SourceSampleFormat::Float, WavBitDepth::F32),
+            (SourceSampleFormat::Unknown, WavBitDepth::F32),
+        ];
+        for (source, expected) in cases {
+            assert_eq!(WavBitDepth::Auto.resolve(source), expected);
+        }
+        // Explicit formats are never overridden.
+        for depth in [
+            WavBitDepth::S16,
+            WavBitDepth::S24,
+            WavBitDepth::S32,
+            WavBitDepth::F32,
+        ] {
+            assert_eq!(depth.resolve(SourceSampleFormat::Int24), depth);
+        }
     }
 
     #[test]

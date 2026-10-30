@@ -5,7 +5,7 @@ use symphonia::core::{
     audio::{Audio, GenericAudioBufferRef},
     codecs::{
         CodecParameters,
-        audio::{AudioDecoder, AudioDecoderOptions},
+        audio::{AudioCodecParameters, AudioDecoder, AudioDecoderOptions},
     },
     errors::Error as SymphoniaError,
     formats::{FormatOptions, FormatReader, TrackType, probe::Hint},
@@ -14,6 +14,43 @@ use symphonia::core::{
 };
 
 use crate::error::DecodeError;
+
+/// Sample format of the source audio as declared by the container/codec, used
+/// to pick a matching output sample format. Lossy codecs report `Unknown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceSampleFormat {
+    Int8,
+    Int16,
+    Int24,
+    Int32,
+    Float,
+    Unknown,
+}
+
+impl SourceSampleFormat {
+    /// Derives the source format from the codec parameters, preferring the
+    /// declared sample format and falling back to the declared bit depth.
+    #[must_use]
+    pub fn from_codec_params(params: &AudioCodecParameters) -> Self {
+        use symphonia::core::audio::sample::SampleFormat;
+        if let Some(format) = params.sample_format {
+            return match format {
+                SampleFormat::U8 | SampleFormat::S8 => Self::Int8,
+                SampleFormat::S16 => Self::Int16,
+                SampleFormat::S24 => Self::Int24,
+                SampleFormat::S32 => Self::Int32,
+                SampleFormat::F32 | SampleFormat::F64 => Self::Float,
+                _ => Self::Unknown,
+            };
+        }
+        match params.bits_per_sample {
+            Some(8) => Self::Int8,
+            Some(16) => Self::Int16,
+            Some(24) => Self::Int24,
+            _ => Self::Unknown,
+        }
+    }
+}
 
 /// An opened audio file with a decoder prepared for its default audio track.
 pub struct DecodedAudio {
@@ -24,6 +61,8 @@ pub struct DecodedAudio {
     pub sample_rate: u32,
     /// Number of channels of the default audio track.
     pub channels: u16,
+    /// Sample format of the source audio.
+    pub source_format: SourceSampleFormat,
 }
 
 /// Opens an audio file and prepares a decoder for its default audio track.
@@ -61,6 +100,7 @@ pub fn open(path: &Path) -> Result<DecodedAudio, DecodeError> {
         .map(|c| c.count() as u16)
         .ok_or(DecodeError::MissingChannelSpec)?;
     let track_id = track.id;
+    let source_format = SourceSampleFormat::from_codec_params(audio_params);
     let decoder = symphonia::default::get_codecs()
         .make_audio_decoder(audio_params, &AudioDecoderOptions::default())?;
 
@@ -70,6 +110,7 @@ pub fn open(path: &Path) -> Result<DecodedAudio, DecodeError> {
         track_id,
         sample_rate,
         channels,
+        source_format,
     })
 }
 
@@ -118,7 +159,7 @@ impl DecodedAudio {
 }
 
 /// Maximum absolute value of a signed 24-bit sample: 2^23 - 1.
-const MAX_S24: f32 = 8_388_607.0;
+pub(crate) const MAX_S24: f32 = 8_388_607.0;
 
 /// Converts a decoded audio buffer to planar f32 samples normalized to
 /// [-1.0, 1.0].

@@ -34,9 +34,11 @@ Options:
 <input_directory>                     Input directory for audio files
 -o, --output <path>                   Output directory (default: override input audios)
 -s, --sample-percentage <float>       Percentage of files to sample (default: 1.00, samples all audio files)
--t, --trim-percentage <float>         Trimming percentage for averaging (default: 0.30, removes the highest 15% and lowest 15%)
+    --trim-percentage <float>         Trimming percentage for averaging (default: 0.30, removes the highest 15% and lowest 15%)
     --target-lufs <float>             Target loudness value (LUFS) (default: auto-calculated)
     --true-peak-db <float>            Target true peak (dBTP) (default: -1.5)
+    --wav-bit-depth <format>          WAV output sample format: auto, s16, s24, s32, f32 (default: auto)
+    --ogg-quality <float>             Ogg Vorbis perceptual quality (default: 5.0, scale 0.0 to 10.0)
 -t, --threads <number>                Number of processing threads (default: CPU core count)
 -n, --measure-only                    Only measure and report the target loudness (LUFS) without writing files
 ```
@@ -44,6 +46,8 @@ Options:
 ## Tip
 
 - Currently, only WAV and OGG encoders are supported. If the input format is not OGG, the output will be in WAV format, and the original file will be preserved as is. If you need the equalized audio to retain its original format, you must convert it manually.
+- The WAV output sample format defaults to matching lossless integer sources (8/16-bit becomes 16-bit, 24-bit stays 24-bit, 32-bit stays 32-bit); float and lossy sources produce 32-bit float. Override with `--wav-bit-depth`.
+- Ogg Vorbis output is encoded at perceptual quality 5 by default; adjust with `--ogg-quality`.
 - Audio metadata (tags) is not preserved during format conversion.
 
 ## Theory
