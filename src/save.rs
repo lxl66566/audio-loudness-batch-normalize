@@ -26,7 +26,7 @@ enum SaveError {
 /// in-place overwrite) never truncates an existing file before the new
 /// content is complete.
 pub fn save_wav(
-    audio: &mut DecodedAudio,
+    mut audio: DecodedAudio,
     input_path: &Path,
     output_path: &Path,
     final_linear_gain: f64,
@@ -60,6 +60,9 @@ pub fn save_wav(
     writer
         .finalize()
         .map_err(|e| write_error(output_path, e.into()))?;
+    // Close the input file before renaming over it: Windows cannot replace a
+    // file that is still open.
+    drop(audio);
     persist(temp, output_path)
 }
 
@@ -71,7 +74,7 @@ pub fn save_wav(
 /// in-place overwrite) never truncates an existing file before the new
 /// content is complete.
 pub fn save_ogg(
-    audio: &mut DecodedAudio,
+    mut audio: DecodedAudio,
     input_path: &Path,
     output_path: &Path,
     final_linear_gain: f64,
@@ -117,6 +120,9 @@ pub fn save_ogg(
         })
         .map_err(|e| map_save_error(e, input_path, output_path))?;
 
+    // Close the input file before renaming over it: Windows cannot replace a
+    // file that is still open.
+    drop(audio);
     // finish writes the pending blocks and returns the sink; close it before
     // the rename.
     drop(

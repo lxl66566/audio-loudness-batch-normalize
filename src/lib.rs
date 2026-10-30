@@ -417,15 +417,15 @@ fn decode_apply_gain_and_save(
     file_format: &AudioFormat,
     final_linear_gain: f64,
 ) -> Result<(), Error> {
-    let mut audio = decode::open(input_path).map_err(|e| Error::Processing {
+    let audio = decode::open(input_path).map_err(|e| Error::Processing {
         path: input_path.to_path_buf(),
         source: e.into(),
     })?;
 
     match file_format {
-        AudioFormat::Ogg => save_ogg(&mut audio, input_path, output_path, final_linear_gain),
+        AudioFormat::Ogg => save_ogg(audio, input_path, output_path, final_linear_gain),
         // All other formats are saved as WAV.
-        _ => save_wav(&mut audio, input_path, output_path, final_linear_gain),
+        _ => save_wav(audio, input_path, output_path, final_linear_gain),
     }
 }
 
@@ -623,4 +623,185 @@ fn find_audio_files(input_dir: impl AsRef<Path>) -> Result<Vec<PathBuf>, Error> 
         }
     }
     Ok(audio_files)
+}
+
+#[cfg(test)]
+mod tests {
+    use symphonia::core::audio::{
+        AudioBuffer, AudioMut, AudioSpec, Channels, GenericAudioBufferRef, sample::i24,
+    };
+
+    use super::*;
+
+    fn measurement_map(
+        loudnesses: &[f64],
+    ) -> HashMap<PathBuf, Result<AudioStats, MeasurementError>> {
+        loudnesses
+            .iter()
+            .enumerate()
+            .map(|(i, &l)| {
+                (
+                    PathBuf::from(format!("{i}")),
+                    Ok(AudioStats {
+                        loudness_lufs: l,
+                        true_peak_db: 0.0,
+                    }),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn target_loudness_trims_both_ends() {
+        let measurements = measurement_map(&[-30.0, -20.0, -10.0, -10.0, 0.0]);
+        // Trim 1 value from each end: mean of [-20, -10, -10].
+        assert!(
+            (calculate_target_loudness(&measurements, 0.2).unwrap() - (-40.0 / 3.0)).abs() < 1e-9
+        );
+    }
+
+    #[test]
+    fn target_loudness_falls_back_when_trim_would_empty_the_slice() {
+        // count == 2 * trim_count: not enough samples to trim, mean of all.
+        let measurements = measurement_map(&[-40.0, -30.0, -20.0, -10.0]);
+        assert!((calculate_target_loudness(&measurements, 0.5).unwrap() - (-25.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn target_loudness_ignores_non_finite_measurements() {
+        let measurements = measurement_map(&[f64::NAN, -20.0, f64::INFINITY, -10.0]);
+        assert!((calculate_target_loudness(&measurements, 0.0).unwrap() - (-15.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn target_loudness_fails_without_valid_measurements() {
+        let measurements = measurement_map(&[f64::NAN, f64::INFINITY]);
+        assert!(calculate_target_loudness(&measurements, 0.3).is_err());
+        assert!(calculate_target_loudness(&HashMap::new(), 0.3).is_err());
+    }
+
+    #[test]
+    fn gain_without_peak_limiting() {
+        let stats = AudioStats {
+            loudness_lufs: -20.0,
+            true_peak_db: -12.0,
+        };
+        // +6 dB loudness gain, peak after gain -6.0 dBTP < -1.5 dBTP: no
+        // limiting.
+        assert!((compute_gain(stats, -14.0, -1.5) - 10.0_f64.powf(6.0 / 20.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn gain_limited_by_true_peak() {
+        let stats = AudioStats {
+            loudness_lufs: -20.0,
+            true_peak_db: -5.0,
+        };
+        // +6 dB loudness gain would push the peak to +1.0 dBTP; limited to
+        // -1.5 dBTP, so the combined gain is 6.0 - 2.5 = 3.5 dB.
+        assert!((compute_gain(stats, -14.0, -1.5) - 10.0_f64.powf(3.5 / 20.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn converts_u8_to_planar_f32() {
+        let mut buf = AudioBuffer::<u8>::new(AudioSpec::new(44_100, Channels::Discrete(1)), 3);
+        buf.resize_uninit(3);
+        buf.plane_mut(0).unwrap().copy_from_slice(&[128, 255, 0]);
+        let planar =
+            decode::convert_buffer_to_planar_f32(&GenericAudioBufferRef::U8(&buf)).unwrap();
+        assert_eq!(planar.len(), 1);
+        assert!((planar[0][0] - 0.0).abs() < 1e-6);
+        assert!((planar[0][1] - 127.0 / 128.0).abs() < 1e-6);
+        assert!((planar[0][2] - (-1.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn converts_s16_to_planar_f32() {
+        let mut buf = AudioBuffer::<i16>::new(AudioSpec::new(44_100, Channels::Discrete(2)), 2);
+        buf.resize_uninit(2);
+        buf.plane_mut(0).unwrap().copy_from_slice(&[0, i16::MAX]);
+        buf.plane_mut(1).unwrap().copy_from_slice(&[i16::MIN, -1]);
+        let planar =
+            decode::convert_buffer_to_planar_f32(&GenericAudioBufferRef::S16(&buf)).unwrap();
+        assert_eq!(planar.len(), 2);
+        assert_eq!(planar[0][0], 0.0);
+        assert_eq!(planar[0][1], 1.0);
+        assert_eq!(planar[1][0], i16::MIN as f32 / i16::MAX as f32);
+        assert_eq!(planar[1][1], -1.0 / i16::MAX as f32);
+    }
+
+    #[test]
+    fn converts_s24_to_planar_f32() {
+        let mut buf = AudioBuffer::<i24>::new(AudioSpec::new(44_100, Channels::Discrete(1)), 2);
+        buf.resize_uninit(2);
+        buf.plane_mut(0)
+            .unwrap()
+            .copy_from_slice(&[i24::MAX, i24::MIN]);
+        let planar =
+            decode::convert_buffer_to_planar_f32(&GenericAudioBufferRef::S24(&buf)).unwrap();
+        assert_eq!(planar[0][0], 1.0);
+        assert_eq!(planar[0][1], -8_388_608.0 / 8_388_607.0);
+    }
+
+    #[test]
+    fn converts_s32_to_planar_f32() {
+        let mut buf = AudioBuffer::<i32>::new(AudioSpec::new(44_100, Channels::Discrete(1)), 2);
+        buf.resize_uninit(2);
+        buf.plane_mut(0).unwrap().copy_from_slice(&[0, i32::MAX]);
+        let planar =
+            decode::convert_buffer_to_planar_f32(&GenericAudioBufferRef::S32(&buf)).unwrap();
+        assert_eq!(planar[0][0], 0.0);
+        assert_eq!(planar[0][1], 1.0);
+    }
+
+    #[test]
+    fn converts_floats_to_planar_f32() {
+        let mut f32_buf = AudioBuffer::<f32>::new(AudioSpec::new(44_100, Channels::Discrete(1)), 2);
+        f32_buf.resize_uninit(2);
+        f32_buf.plane_mut(0).unwrap().copy_from_slice(&[0.25, -0.5]);
+        let planar =
+            decode::convert_buffer_to_planar_f32(&GenericAudioBufferRef::F32(&f32_buf)).unwrap();
+        assert_eq!(planar[0], vec![0.25, -0.5]);
+
+        let mut f64_buf = AudioBuffer::<f64>::new(AudioSpec::new(44_100, Channels::Discrete(1)), 2);
+        f64_buf.resize_uninit(2);
+        f64_buf.plane_mut(0).unwrap().copy_from_slice(&[0.25, -0.5]);
+        let planar =
+            decode::convert_buffer_to_planar_f32(&GenericAudioBufferRef::F64(&f64_buf)).unwrap();
+        assert_eq!(planar[0], vec![0.25, -0.5]);
+    }
+
+    #[test]
+    fn rejects_unsupported_buffer_format() {
+        let mut buf = AudioBuffer::<u16>::new(AudioSpec::new(44_100, Channels::Discrete(1)), 1);
+        buf.resize_uninit(1);
+        buf.plane_mut(0).unwrap().copy_from_slice(&[0u16]);
+        assert!(decode::convert_buffer_to_planar_f32(&GenericAudioBufferRef::U16(&buf)).is_err());
+    }
+
+    #[test]
+    fn rms_dbfs_of_empty_or_silent_signal() {
+        assert_eq!(calculate_rms_dbfs(0.0, 0), f64::NEG_INFINITY);
+        assert_eq!(calculate_rms_dbfs(0.0, 100), f64::NEG_INFINITY);
+    }
+
+    #[test]
+    fn rms_dbfs_of_known_amplitude() {
+        // 4 samples at amplitude 0.5 -> RMS 0.5 -> -6.0206 dBFS.
+        assert!((calculate_rms_dbfs(4.0 * 0.25, 4) - 20.0 * 0.5_f64.log10()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn format_from_path_is_case_insensitive() {
+        assert_eq!(AudioFormat::from_path("a/b/c.WAV"), Some(AudioFormat::Wav));
+        assert_eq!(AudioFormat::from_path("x.Mp3"), Some(AudioFormat::Mp3));
+        assert_eq!(AudioFormat::from_path("y.ogg"), Some(AudioFormat::Ogg));
+    }
+
+    #[test]
+    fn format_from_path_rejects_unknown_extensions() {
+        assert_eq!(AudioFormat::from_path("x.txt"), None);
+        assert_eq!(AudioFormat::from_path("noext"), None);
+        assert_eq!(AudioFormat::from_path(".hidden"), None);
+    }
 }
