@@ -38,7 +38,8 @@ path              = "src/main.rs"
 required-features = ["bin"]
 
 [profile.release]
-lto       = true
-opt-level = "z"
-panic     = "abort"
-strip     = true
+codegen-units = 1
+lto           = true
+opt-level     = 3
+panic         = "abort"
+strip         = true
