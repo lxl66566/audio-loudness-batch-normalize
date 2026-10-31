@@ -221,3 +221,83 @@ pub(crate) fn convert_buffer_to_planar_f32(
     }
     Ok(planar_output)
 }
+
+#[cfg(test)]
+mod tests {
+    use symphonia::core::audio::{
+        AudioBuffer, AudioMut, AudioSpec, Channels, GenericAudioBufferRef, sample::i24,
+    };
+
+    use super::convert_buffer_to_planar_f32;
+
+    #[test]
+    fn converts_u8_to_planar_f32() {
+        let mut buf = AudioBuffer::<u8>::new(AudioSpec::new(44_100, Channels::Discrete(1)), 3);
+        buf.resize_uninit(3);
+        buf.plane_mut(0).unwrap().copy_from_slice(&[128, 255, 0]);
+        let planar = convert_buffer_to_planar_f32(&GenericAudioBufferRef::U8(&buf)).unwrap();
+        assert_eq!(planar.len(), 1);
+        assert!((planar[0][0] - 0.0).abs() < 1e-6);
+        assert!((planar[0][1] - 127.0 / 128.0).abs() < 1e-6);
+        assert!((planar[0][2] - (-1.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn converts_s16_to_planar_f32() {
+        let mut buf = AudioBuffer::<i16>::new(AudioSpec::new(44_100, Channels::Discrete(2)), 2);
+        buf.resize_uninit(2);
+        buf.plane_mut(0).unwrap().copy_from_slice(&[0, i16::MAX]);
+        buf.plane_mut(1).unwrap().copy_from_slice(&[i16::MIN, -1]);
+        let planar = convert_buffer_to_planar_f32(&GenericAudioBufferRef::S16(&buf)).unwrap();
+        assert_eq!(planar.len(), 2);
+        assert_eq!(planar[0][0], 0.0);
+        assert_eq!(planar[0][1], 1.0);
+        assert_eq!(planar[1][0], f32::from(i16::MIN) / f32::from(i16::MAX));
+        assert_eq!(planar[1][1], -1.0 / f32::from(i16::MAX));
+    }
+
+    #[test]
+    fn converts_s24_to_planar_f32() {
+        let mut buf = AudioBuffer::<i24>::new(AudioSpec::new(44_100, Channels::Discrete(1)), 2);
+        buf.resize_uninit(2);
+        buf.plane_mut(0)
+            .unwrap()
+            .copy_from_slice(&[i24::MAX, i24::MIN]);
+        let planar = convert_buffer_to_planar_f32(&GenericAudioBufferRef::S24(&buf)).unwrap();
+        assert_eq!(planar[0][0], 1.0);
+        assert_eq!(planar[0][1], -8_388_608.0 / 8_388_607.0);
+    }
+
+    #[test]
+    fn converts_s32_to_planar_f32() {
+        let mut buf = AudioBuffer::<i32>::new(AudioSpec::new(44_100, Channels::Discrete(1)), 2);
+        buf.resize_uninit(2);
+        buf.plane_mut(0).unwrap().copy_from_slice(&[0, i32::MAX]);
+        let planar = convert_buffer_to_planar_f32(&GenericAudioBufferRef::S32(&buf)).unwrap();
+        assert_eq!(planar[0][0], 0.0);
+        assert_eq!(planar[0][1], 1.0);
+    }
+
+    #[test]
+    fn converts_floats_to_planar_f32() {
+        let mut f32_buf = AudioBuffer::<f32>::new(AudioSpec::new(44_100, Channels::Discrete(1)), 2);
+        f32_buf.resize_uninit(2);
+        f32_buf.plane_mut(0).unwrap().copy_from_slice(&[0.25, -0.5]);
+        let planar = convert_buffer_to_planar_f32(&GenericAudioBufferRef::F32(&f32_buf)).unwrap();
+        assert_eq!(planar[0], vec![0.25, -0.5]);
+
+        let mut f64_buf = AudioBuffer::<f64>::new(AudioSpec::new(44_100, Channels::Discrete(1)), 2);
+        f64_buf.resize_uninit(2);
+        f64_buf.plane_mut(0).unwrap().copy_from_slice(&[0.25, -0.5]);
+        let planar = convert_buffer_to_planar_f32(&GenericAudioBufferRef::F64(&f64_buf)).unwrap();
+        assert_eq!(planar[0], vec![0.25, -0.5]);
+    }
+
+    #[test]
+    fn rejects_unsupported_buffer_format() {
+        let mut buf = AudioBuffer::<u16>::new(AudioSpec::new(44_100, Channels::Discrete(1)), 1);
+        buf.resize_uninit(1);
+        buf.plane_mut(0).unwrap().copy_from_slice(&[0u16]);
+        assert!(convert_buffer_to_planar_f32(&GenericAudioBufferRef::U16(&buf)).is_err());
+    }
+}

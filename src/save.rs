@@ -4,10 +4,19 @@ use tempfile::NamedTempFile;
 use vorbis_rs::{VorbisBitrateManagementStrategy, VorbisEncoderBuilder};
 
 use crate::{
-    WavBitDepth,
     decode::{DecodedAudio, MAX_S24},
     error::{DecodeError, Error, ProcessingError, WritingError},
+    format::WavBitDepth,
 };
+
+/// Per-file encoding settings.
+#[derive(Debug, Clone, Copy)]
+pub struct EncodeConfig {
+    /// Sample format for WAV output files.
+    pub wav_bit_depth: WavBitDepth,
+    /// Ogg Vorbis perceptual quality on the 0-10 scale.
+    pub ogg_quality: f64,
+}
 
 /// Error while saving decoded audio: a decode failure on the input, or a
 /// write failure on the output.
