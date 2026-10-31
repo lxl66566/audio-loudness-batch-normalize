@@ -111,7 +111,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ebur128",
- "env_filter",
+ "env_filter 2.0.0",
  "hound",
  "indicatif",
  "log",
@@ -361,6 +361,16 @@ name = "env_filter"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1bf3c259d255ca70051b30e2e95b5446cdb8949ac4cd22c0d7fd634d89f568e2"
+dependencies = [
+ "log",
+ "regex",
+]
+
+[[package]]
+name = "env_filter"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "900d271a03799a1ee8d1ca9b19893b48ca674a9284fefcfb85f05e74ed314217"
 dependencies = [
  "log",
  "regex",
@@ -951,7 +961,7 @@ dependencies = [
  "bytemuck",
  "chrono",
  "dyn-clone",
- "env_filter",
+ "env_filter 0.1.4",
  "flexible-string",
  "libc",
  "log",
